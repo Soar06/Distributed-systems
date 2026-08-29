@@ -36,6 +36,45 @@ const headerSize = 8
 // huge allocation.
 const maxRecordSize = 64 << 20 // 64 MiB
 
+// frameRecord wraps a payload in the WAL's on-disk record format:
+// [4-byte length][4-byte CRC32][payload]. Exposed so RaftState can write a
+// single framed record atomically without going through Append.
+func frameRecord(payload []byte) []byte {
+	out := make([]byte, headerSize+len(payload))
+	binary.LittleEndian.PutUint32(out[0:4], uint32(len(payload)))
+	binary.LittleEndian.PutUint32(out[4:8], crc32.ChecksumIEEE(payload))
+	copy(out[headerSize:], payload)
+	return out
+}
+
+// readFramedFile reads a whole file written by frameRecord and returns its
+// payload. A missing file returns (nil, nil); a truncated or checksum-failing
+// file also returns (nil, nil) — treated as "no state", which is correct because
+// an atomically-written file is either wholly present or wholly absent, so a bad
+// one means the very first write was interrupted.
+func readFramedFile(path string) ([]byte, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("storage: read state: %w", err)
+	}
+	if len(data) < headerSize {
+		return nil, nil
+	}
+	length := binary.LittleEndian.Uint32(data[0:4])
+	want := binary.LittleEndian.Uint32(data[4:8])
+	if length > maxRecordSize || int(length) != len(data)-headerSize {
+		return nil, nil
+	}
+	payload := data[headerSize:]
+	if crc32.ChecksumIEEE(payload) != want {
+		return nil, nil
+	}
+	return payload, nil
+}
+
 // checksum is the shared CRC32 used by the WAL and the applied-index file.
 func checksum(b []byte) uint32 { return crc32.ChecksumIEEE(b) }
 

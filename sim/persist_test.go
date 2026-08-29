@@ -19,11 +19,8 @@ func TestRestartPreservesTermVoteAndLog(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "n1.wal")
 
-	wal, err := storage.Open(path)
-	if err != nil {
-		t.Fatalf("open wal: %v", err)
-	}
-	st := storage.NewRaftState(wal)
+	walPath := path
+	st := storage.OpenRaftState(walPath, nil)
 
 	peers := []raft.NodeID{"n1", "n2", "n3"}
 	s := raft.NewServerWith("n1", peers, &CountingSM{}, nil, raft.DefaultConfig(), 1)
@@ -41,17 +38,12 @@ func TestRestartPreservesTermVoteAndLog(t *testing.T) {
 
 	wantTerm := s.CurrentTerm()
 	wantLog := s.LogEntries()
-	wal.Close()
 
 	// "Restart": a brand-new Server object reading the same WAL.
-	wal2, err := storage.Open(path)
-	if err != nil {
-		t.Fatalf("reopen wal: %v", err)
-	}
-	defer wal2.Close()
+	walPath2 := path
 
 	s2 := raft.NewServerWith("n1", peers, &CountingSM{}, nil, raft.DefaultConfig(), 1)
-	s2.SetStorage(storage.NewRaftState(wal2))
+	s2.SetStorage(storage.OpenRaftState(walPath2, nil))
 	if err := s2.Restore(); err != nil {
 		t.Fatalf("restore: %v", err)
 	}
@@ -78,23 +70,21 @@ func TestRestartedNodeDoesNotVoteTwiceInSameTerm(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "voter.wal")
 
-	wal, _ := storage.Open(path)
+	walPath := path
 	peers := []raft.NodeID{"n1", "n2", "n3"}
 
 	s := raft.NewServerWith("n1", peers, &CountingSM{}, nil, raft.DefaultConfig(), 1)
-	s.SetStorage(storage.NewRaftState(wal))
+	s.SetStorage(storage.OpenRaftState(walPath, nil))
 
 	first := s.RequestVote(raft.RequestVoteArgs{Term: 7, CandidateID: "n2"})
 	if !first.VoteGranted {
 		t.Fatal("first vote should be granted")
 	}
-	wal.Close()
 
 	// Crash and restart.
-	wal2, _ := storage.Open(path)
-	defer wal2.Close()
+	walPath2 := path
 	s2 := raft.NewServerWith("n1", peers, &CountingSM{}, nil, raft.DefaultConfig(), 1)
-	s2.SetStorage(storage.NewRaftState(wal2))
+	s2.SetStorage(storage.OpenRaftState(walPath2, nil))
 	if err := s2.Restore(); err != nil {
 		t.Fatalf("restore: %v", err)
 	}

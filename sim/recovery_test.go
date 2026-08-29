@@ -29,15 +29,12 @@ func newPersistentServer(t *testing.T, dir string, id raft.NodeID, peers []raft.
 	sm raft.StateMachine) (*raft.Server, *storage.RaftState) {
 	t.Helper()
 
-	wal, err := storage.Open(filepath.Join(dir, string(id)+".wal"))
-	if err != nil {
-		t.Fatalf("open wal: %v", err)
-	}
+	walPath := filepath.Join(dir, string(id)+".wal")
 	app, err := storage.OpenApplied(filepath.Join(dir, string(id)+".applied"))
 	if err != nil {
 		t.Fatalf("open applied: %v", err)
 	}
-	st := storage.NewRaftStateWithApplied(wal, app)
+	st := storage.OpenRaftState(walPath, app)
 
 	srv := raft.NewServerWith(id, peers, sm, nil, raft.DefaultConfig(), 1)
 	srv.SetStorage(st)

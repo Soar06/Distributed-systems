@@ -237,11 +237,17 @@ func (s *Server) Restore() error {
 		}
 		prevApplied := Index(raw)
 		if prevApplied > s.lastIndex() {
-			// The log is shorter than what we claim to have applied. That should be
-			// impossible — entries are persisted before they are applied — so treat
-			// it as corruption rather than silently replaying a prefix.
-			return fmt.Errorf("raft: persisted lastApplied %d exceeds log length %d",
-				prevApplied, s.lastIndex())
+			// The applied marker is ahead of the log. This is NOT impossible, and an
+			// earlier version of this code wrongly refused to start because of it:
+			// a follower can apply entries 1..5, then AppendEntries receiver rule 3
+			// truncates its log to 3 when a new leader replaces a diverged suffix.
+			// The marker and the log are separate files with no ordering between
+			// them, so they can and do diverge.
+			//
+			// Clamp and continue. Refusing to boot turns a routine, recoverable
+			// state into a permanent outage — the same reasoning AppliedFile.Load
+			// already applies to a corrupt record.
+			prevApplied = s.lastIndex()
 		}
 		for i := Index(1); i <= prevApplied; i++ {
 			e, ok := s.entryAt(i)

@@ -55,11 +55,6 @@ func main() {
 	// Durable state. Each node gets its own file: nodes share no storage, even on
 	// one machine.
 	walPath := filepath.Join(*dataDir, *id+".wal")
-	wal, err := storage.Open(walPath)
-	if err != nil {
-		log.Fatalf("node: open wal: %v", err)
-	}
-	defer wal.Close()
 
 	// Records how far the state machine has been applied, so a restart replays the
 	// log and comes back with the same ledger rather than an empty one. Without it
@@ -87,7 +82,7 @@ func main() {
 	defer transport.Close()
 
 	srv := raft.NewServerWith(raft.NodeID(*id), ids, machine, transport, raft.DefaultConfig(), s)
-	srv.SetStorage(storage.NewRaftStateWithApplied(wal, appliedFile))
+	srv.SetStorage(storage.OpenRaftState(walPath, appliedFile))
 
 	// Recover anything this node durably knew before it last stopped.
 	if err := srv.Restore(); err != nil {

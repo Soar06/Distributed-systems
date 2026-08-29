@@ -63,16 +63,13 @@ func startCluster(t *testing.T, n int) *testCluster {
 	// Two passes: create listeners to learn real ports, then wire transports.
 	listeners := make(map[raft.NodeID]*Server)
 	for i, id := range c.ids {
-		wal, err := storage.Open(filepath.Join(dir, string(id)+".wal"))
-		if err != nil {
-			t.Fatalf("wal %s: %v", id, err)
-		}
+		walPath := filepath.Join(dir, string(id)+".wal")
 		st := ledger.New()
 		machine := ledger.NewMachine(st)
 
 		tr := NewTransport(c.addrs, 300*time.Millisecond)
 		srv := raft.NewServerWith(id, c.ids, machine, tr, cfg, int64(i+1)*7919)
-		srv.SetStorage(storage.NewRaftState(wal))
+		srv.SetStorage(storage.OpenRaftState(walPath, nil))
 
 		api := NewClientService(srv, machine, c.addrs)
 		rs, err := Listen("127.0.0.1:0", srv, api)
@@ -83,7 +80,6 @@ func startCluster(t *testing.T, n int) *testCluster {
 
 		c.servers[id] = srv
 		c.states[id] = st
-		c.wals[id] = wal
 		c.trans[id] = tr
 		listeners[id] = rs
 		_ = pending{}
@@ -100,7 +96,6 @@ func startCluster(t *testing.T, n int) *testCluster {
 			c.servers[id].Stop()
 			c.rpcs[id].Close()
 			c.trans[id].Close()
-			c.wals[id].Close()
 		}
 	})
 	return c

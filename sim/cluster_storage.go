@@ -38,22 +38,16 @@ func NewClusterWithStorage(t *testing.T, n int, seed int64, dir string) *Cluster
 		Nodes:   make(map[raft.NodeID]*raft.Server),
 		SMs:     make(map[raft.NodeID]*CountingSM),
 		history: make(map[raft.NodeID][]string),
-		wals:    make(map[raft.NodeID]*storage.WAL),
 	}
 
 	for i, id := range ids {
-		wal, err := storage.Open(filepath.Join(dir, string(id)+".wal"))
-		if err != nil {
-			t.Fatalf("open wal for %s: %v", id, err)
-		}
 		sm := &CountingSM{}
 		s := raft.NewServerWith(id, ids, sm, net, cfg, seed+int64(i)*7919)
-		s.SetStorage(storage.NewRaftState(wal))
+		s.SetStorage(storage.OpenRaftState(filepath.Join(dir, string(id)+".wal"), nil))
 
 		net.Register(id, s)
 		c.Nodes[id] = s
 		c.SMs[id] = sm
-		c.wals[id] = wal
 	}
 	return c
 }
@@ -69,12 +63,7 @@ func (c *Cluster) RestoreAll() error {
 	return nil
 }
 
-// CloseStorage closes every node's WAL, releasing the file handles so the same
-// directory can be reopened by a "restarted" cluster.
-func (c *Cluster) CloseStorage() {
-	for _, w := range c.wals {
-		if w != nil {
-			w.Close()
-		}
-	}
-}
+// CloseStorage is retained for symmetry with the restart flow. Nothing is held
+// open: state files are replaced atomically by rename and read by path, so a
+// "restarted" cluster can reopen the same directory immediately.
+func (c *Cluster) CloseStorage() {}

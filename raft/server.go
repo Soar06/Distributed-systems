@@ -68,6 +68,11 @@ type Server struct {
 	// measured throughput a function of timer granularity rather than of the
 	// system under test.
 	applyWaiters map[Index][]chan struct{}
+
+	// appliedErrs counts failures to persist the applied marker, with the most
+	// recent error. Not fatal (replay is idempotent), but not silent either.
+	appliedErrs    int
+	lastAppliedErr error
 }
 
 // WaitApplied returns a channel closed once the entry at idx has been applied.
@@ -169,6 +174,25 @@ func (s *Server) LastApplied() Index {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.lastApplied
+}
+
+// recordAppliedError notes a failure to persist the applied marker. Kept as
+// state rather than logged directly so the surrounding process can decide how to
+// surface it (metrics, logs, health check) without this package choosing.
+func (s *Server) recordAppliedError(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.appliedErrs++
+	s.lastAppliedErr = err
+}
+
+// AppliedPersistFailures returns how many times the applied marker failed to
+// persist, and the most recent error. A non-zero count means restarts will replay
+// more of the log than necessary, and that storage is unhealthy.
+func (s *Server) AppliedPersistFailures() (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.appliedErrs, s.lastAppliedErr
 }
 
 // LogEntries returns a copy of the log, sentinel included. For tests and for the
@@ -347,12 +371,25 @@ func (s *Server) applyCommitted() {
 	}
 
 	// Record how far we have applied, so a restart can replay to the same point.
-	// Written after the entries are applied: if we crash between applying and
-	// recording, replay redoes the tail, which is safe because applying the same
-	// log in the same order is deterministic and the state machine's own
-	// idempotency keys absorb the repeat.
+	//
+	// Written AFTER the entries are applied: if we crash in between, replay redoes
+	// the tail, which is safe because applying the same log in the same order is
+	// deterministic and the state machine's idempotency keys absorb the repeat.
+	//
+	// Deliberately NOT fatal, unlike a failed Raft-state persist. A lost applied
+	// marker only costs replay work on restart — it cannot corrupt anything,
+	// because replaying is idempotent. But it must not be silently ignored either:
+	// the failure is recorded so an operator can see storage degrading.
+	//
+	// The write is handed to a background goroutine so its fsync does not run on
+	// the hot path while s.mu is held.
 	if as, ok := s.storage.(AppliedStorage); ok && s.lastApplied > 0 {
-		_ = as.SaveApplied(uint64(s.lastApplied))
+		idx := uint64(s.lastApplied)
+		go func() {
+			if err := as.SaveApplied(idx); err != nil {
+				s.recordAppliedError(err)
+			}
+		}()
 	}
 
 	s.signalApplied()
