@@ -161,8 +161,15 @@ core-bank/
 - [x] Repo created, `fe/bank-app` and `fe/cluster-dashboard` static mockups in place
       (mock data, no backend wiring yet).
 - [x] Phase 1 design spec written — see **[DESIGN.md](DESIGN.md)** (Raft state
-      machine per Figure 2 + double-entry ledger domain model). Design only; no
-      implementation.
-- Phase 1 implementation **not started**: there is no `go.mod` and no Go source in
-  the repo yet. Next step: `go.mod` + `raft/` types and role loop, tested against a
-  trivial state machine before the ledger is wired in.
+      machine per Figure 2 + double-entry ledger domain model).
+- [x] `raft/` implemented and tested: leader election, log replication, commit
+      index, and the full Figure 2 role loop. Go 1.27.
+- [x] `sim/` chaos harness (Netflix Chaos Monkey methodology — see
+      [learn/READING_LIST.md](../learn/READING_LIST.md) §5): deterministic seeded
+      fault injection (crash / partition / packet loss / duplication) with all five
+      Figure 3 safety properties asserted executably. Leader kill, minority-partition
+      split-brain, and healed-partition convergence all covered.
+- Phase 1 **not complete**. Still missing: persistence (`storage/`), gRPC transport
+  (`rpc/`), the ledger domain (`ledger/`), the node binary (`node/`), linearizable
+  reads, and the "more nodes ≠ more write throughput" demo. Nodes are currently
+  in-process objects on a simulated network, not separate OS processes.

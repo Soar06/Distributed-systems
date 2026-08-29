@@ -92,6 +92,59 @@ comparing consensus protocols; not needed to build Phase 1.
 
 ---
 
+## 5. Chaos engineering (Chaos Monkey / Simian Army)
+
+**What the theory does:** Inverts how failure is tested. Instead of hoping the
+system survives rare failures and finding out during a real incident, failures are
+injected *deliberately and continuously* so that surviving them becomes routine and
+regressions surface immediately. Netflix's Chaos Monkey pioneered this by randomly
+terminating instances in production; the Simian Army extended it (Latency Monkey for
+degraded network calls, Chaos Gorilla for whole-availability-zone loss).
+
+Why it matters here specifically: Raft's guarantees are *entirely* about behavior
+under failure. A Raft implementation that is only tested on the happy path has not
+been tested at all — leader crashes, partitions, and dropped/delayed/duplicated RPCs
+are the conditions Figure 3's safety properties exist to survive. This is the
+methodology behind [Agents/RULES.md](../Agents/RULES.md) rule 3 and the `sim/`
+package.
+
+**The five principles** (from principlesofchaos.org, quoted):
+
+> "Chaos Engineering is the discipline of experimenting on a system in order to
+> build confidence in the system's capability to withstand turbulent conditions in
+> production."
+
+1. **Build a hypothesis around steady-state behavior** — assert on measurable
+   output, not internal attributes. *Our steady state:* exactly one leader per term,
+   no lost or duplicated money, Figure 3 holds.
+2. **Vary real-world events** — inject authentic failures: node crash, network
+   partition, message loss/delay/duplication/reordering.
+3. **Run experiments in production** — *deliberately not adopted here.* This is the
+   one principle that does not transfer: this is a learning project with no
+   production, and injecting faults into a real ledger is not defensible. We run
+   chaos against a deterministic simulated network instead.
+4. **Automate experiments to run continuously** — chaos tests are ordinary `go test`
+   cases in CI, not a manual exercise.
+5. **Minimize blast radius** — the simulator is the blast radius by construction.
+
+**Primary sources:**
+- **principlesofchaos.org** — the canonical five principles, quoted above.
+- Netflix Technology Blog, *"The Netflix Simian Army"* (2011) — the original
+  Chaos Monkey / Latency Monkey / Chaos Gorilla writeup.
+  *(Note: netflixtechblog.com returned HTTP 403 to automated fetching on
+  2026-08-29 — read it in a browser.)*
+- **github.com/Netflix/chaosmonkey** — the real implementation, plus its docs.
+- Basiri et al., *"Chaos Engineering"*, IEEE Software 33(3), 2016 — the peer-reviewed
+  writeup of the practice.
+
+**Determinism caveat [project decision]:** our chaos is seeded and reproducible. A
+failing run must be replayable from its seed — an unreproducible consensus bug is
+close to impossible to fix. This is a deliberate divergence from Netflix's genuinely
+random production injection, and it is the right trade for a project whose goal is
+understanding rather than uptime.
+
+---
+
 ## Not yet logged (topics to add as they come up)
 
 - Sharding / consistent hashing (Phase 2)

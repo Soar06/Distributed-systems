@@ -309,6 +309,21 @@ Carried from NOW.md; do **not** resolve these by guesswork:
 ## Status
 
 - [x] Phase 1 design written against Figure 2 / Figure 3 of the extended paper.
-- [ ] Nothing implemented yet — no `go.mod`, no Go source in the repo.
-- Next: `go.mod` + `raft/` types and role loop, with a trivial (non-ledger) state
-  machine to keep `raft/` and `ledger/` independently testable.
+- [x] `raft/` — Figure 2 complete: state, both RPC receiver implementations, and the
+      Rules for Servers role loop (randomized election timeouts, candidate
+      elections, leader heartbeats, `nextIndex` decrement-and-retry replication, and
+      the commit rule including the `log[N].term == currentTerm` safety check).
+- [x] `sim/` — deterministic seeded network with fault injection (crash, partition,
+      packet loss, duplication), a cluster harness, and executable assertions for
+      **all five** Figure 3 safety properties. Leader Completeness became testable
+      once elections existed.
+- [x] Cluster view (`sim/view.go`) — per-node role/term/commit/applied/log snapshot,
+      rendered on test failure. Built in the shape NOW.md's Phase 4 dashboard needs,
+      so wiring the UI later is a rendering job, not a redesign.
+- [ ] **Not implemented:** persistence to stable storage (`storage/`), gRPC
+      transport (`rpc/`), the ledger domain (`ledger/`), the node binary (`node/`),
+      and the client API. Raft state is currently in-memory only, so a crash loses
+      votes — Figure 2's "before responding to RPCs" durability requirement is
+      **not yet met**.
+- Next: `storage/` (WAL for persistent state) or `ledger/` (the real state machine),
+  then `rpc/` + `node/` to make nodes separate processes.

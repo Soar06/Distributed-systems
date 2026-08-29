@@ -1,7 +1,9 @@
 package raft
 
 import (
+	"math/rand"
 	"sync"
+	"time"
 )
 
 // Server is one Raft node: one Go process's worth of consensus state.
@@ -35,13 +37,40 @@ type Server struct {
 	// sm is the replicated application. Committed entries are applied to it in
 	// log order, exactly once, on every server.
 	sm StateMachine
+
+	// --- role loop machinery (loop.go) ---
+
+	cfg       Config
+	transport Transport
+	rnd       *rand.Rand
+
+	// electionDeadline is when this server will start an election if it has not
+	// heard from a leader. heartbeatDeadline is when a leader next sends
+	// heartbeats.
+	electionDeadline  time.Time
+	heartbeatDeadline time.Time
+
+	running bool
+	stopCh  chan struct{}
+	wg      sync.WaitGroup
 }
 
-// NewServer creates a follower with an empty log.
+// NewServer creates a follower with an empty log, using default timings and no
+// transport. Suitable for testing the RPC receiver rules in isolation; use
+// NewServerWith to run the role loop.
 //
 // peers must include id itself: majority calculations are defined over the full
 // cluster (§5.2). All servers start as followers with term 0 (Figure 2, "State").
 func NewServer(id NodeID, peers []NodeID, sm StateMachine) *Server {
+	return NewServerWith(id, peers, sm, nil, DefaultConfig(), 1)
+}
+
+// NewServerWith creates a server with an explicit transport, timing config, and
+// random seed.
+//
+// The seed is explicit so that a chaos run is reproducible: an unreproducible
+// consensus bug is close to impossible to fix (learn/READING_LIST.md §5).
+func NewServerWith(id NodeID, peers []NodeID, sm StateMachine, tr Transport, cfg Config, seed int64) *Server {
 	return &Server{
 		id:    id,
 		peers: peers,
@@ -52,6 +81,9 @@ func NewServer(id NodeID, peers []NodeID, sm StateMachine) *Server {
 		nextIndex:  make(map[NodeID]Index),
 		matchIndex: make(map[NodeID]Index),
 		sm:         sm,
+		cfg:        cfg,
+		transport:  tr,
+		rnd:        newRand(seed),
 	}
 }
 
@@ -149,6 +181,12 @@ func (s *Server) AppendEntries(args AppendEntriesArgs) AppendEntriesReply {
 		s.role = Follower
 	}
 
+	// A valid leader is alive, so do not challenge it: reset the election timer
+	// (Figure 2, "Followers"). This happens even if the log check below fails —
+	// a log inconsistency means we are behind, not that the leader is invalid,
+	// and starting an election here would disrupt a healthy cluster.
+	s.resetElectionTimerLocked()
+
 	// Rule 2: log consistency check.
 	if !s.matchesPrevLog(args.PrevLogIndex, args.PrevLogTerm) {
 		return AppendEntriesReply{Term: s.currentTerm, Success: false}
@@ -198,6 +236,12 @@ func (s *Server) RequestVote(args RequestVoteArgs) RequestVoteReply {
 
 	cand := args.CandidateID
 	s.votedFor = &cand
+
+	// "...without receiving AppendEntries RPC from current leader or granting
+	// vote to candidate" — granting a vote also defers our own election, giving
+	// the candidate we just endorsed time to win.
+	s.resetElectionTimerLocked()
+
 	return RequestVoteReply{Term: s.currentTerm, VoteGranted: true}
 }
 
