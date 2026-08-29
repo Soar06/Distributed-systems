@@ -489,3 +489,71 @@ func TestSimianArmy_RepeatedFaultsPreserveSafety(t *testing.T) {
 	t.Logf("survived 6 chaos rounds, %d writes accepted%s", writes, c.View())
 	checkAll(t, c)
 }
+
+// --- Latency: the timing class of bug the old sim could not see ----------
+
+// The simulator delivered RPCs instantly and synchronously, so an entire class
+// of timing bug was invisible: head-of-line blocking, shared-connection aborts,
+// and an RPC timeout set above the election timeout all require real delay to
+// manifest.
+//
+// This runs the cluster with realistic one-way latency and asserts the same
+// Figure 3 properties still hold.
+func TestSafetyUnderRealisticLatency(t *testing.T) {
+	c := NewCluster(5, 21)
+	// 2-8ms one-way, well inside the 60-120ms election timeout — a healthy LAN.
+	c.Net.SetLatency(2*time.Millisecond, 8*time.Millisecond)
+	c.Start()
+	defer c.Stop()
+
+	leader, ok := c.WaitForLeader(5 * time.Second)
+	if !ok {
+		t.Fatalf("no leader elected under realistic latency%s", c.View())
+	}
+
+	for i := range 10 {
+		c.Nodes[leader].Submit([]byte(fmt.Sprintf("lat%d", i)))
+	}
+	if !c.WaitForCommit(10, 5*time.Second) {
+		t.Fatalf("did not converge under latency%s%s", c.View(), c.View().LogsString())
+	}
+	checkAll(t, c)
+}
+
+// With latency ABOVE the election timeout, the cluster should struggle to keep a
+// stable leader — the §5.2 inequality broadcastTime << electionTimeout is
+// violated. Safety must hold regardless: elections may churn, but no two leaders
+// in one term and no divergent logs.
+func TestSafetyHoldsWhenTimingInequalityIsViolated(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping slow timing test in -short mode")
+	}
+	c := NewCluster(3, 22)
+	// 40-90ms one-way against a 60-120ms election timeout: a round trip can
+	// exceed the timeout, which is exactly the misconfiguration that used to be
+	// shipped as a hardcoded 500ms RPC timeout against a 150-300ms election.
+	c.Net.SetLatency(40*time.Millisecond, 90*time.Millisecond)
+	c.Start()
+	defer c.Stop()
+
+	// Availability is NOT asserted here — losing it is the expected consequence.
+	// Safety is.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := c.CheckElectionSafety(); err != nil {
+			t.Fatalf("%v%s", err, c.View())
+		}
+		if err := c.CheckLogMatching(); err != nil {
+			t.Fatalf("%v%s%s", err, c.View(), c.View().LogsString())
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	terms := make(map[raft.NodeID]raft.Term)
+	for _, id := range c.IDs {
+		terms[id] = c.Nodes[id].CurrentTerm()
+	}
+	t.Logf("under a violated timing inequality, terms churned to %v — safety held%s",
+		terms, c.View())
+	checkAll(t, c)
+}

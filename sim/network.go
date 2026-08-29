@@ -7,13 +7,30 @@
 // injecting faults into a real ledger is not defensible. The simulated network is
 // the blast radius by construction.
 //
-// Every fault is driven by a seeded PRNG so a failing run is reproducible. An
-// unreproducible consensus bug is close to impossible to fix.
+// FAULT SELECTION is driven by per-link seeded PRNGs, so which RPCs are dropped
+// or duplicated on a given link is a function of the seed alone.
+//
+// FULL RUN REPRODUCIBILITY IS NOT ACHIEVED, and claiming otherwise would be
+// dishonest. Election timeouts fire on wall-clock time, so the NUMBER and
+// ORDERING of RPCs still varies between runs of the same seed — measured at
+// roughly 2% variance in total sends. A failing chaos run is therefore usually,
+// but not always, replayable from its seed.
+//
+// Closing the gap requires driving the whole simulation on logical time (a
+// discrete-event scheduler where raft's timers are virtual), which is a
+// substantial redesign of both this package and raft's role loop. It is recorded
+// as outstanding in context/DESIGN.md rather than papered over.
+//
+// An earlier version used ONE shared PRNG, which was materially worse: goroutines
+// reached it in scheduler-dependent order and each call consumed one or two draws,
+// so even the fault pattern differed between runs. That much is now fixed.
 package sim
 
 import (
+	"hash/fnv"
 	"math/rand"
 	"sync"
+	"time"
 
 	"github.com/homura/core-bank/raft"
 )
@@ -42,7 +59,29 @@ type Network struct {
 	// Real networks duplicate packets, and Raft must tolerate it.
 	duplicateRate float64
 
-	rnd *rand.Rand
+	// latencyMin/latencyMax bound the simulated one-way delay per RPC.
+	//
+	// Zero latency (the previous behaviour) hid an entire class of bug: RPCs were
+	// delivered synchronously on the caller's goroutine, so head-of-line blocking,
+	// shared-connection aborts, and an RPC timeout set ABOVE the election timeout
+	// could not manifest. The simulator validated consensus logic while providing
+	// no evidence at all about timing behaviour, which is where the production
+	// risk actually lives.
+	latencyMin time.Duration
+	latencyMax time.Duration
+
+	// links holds one PRNG per (from,to) pair, each seeded deterministically from
+	// the base seed.
+	//
+	// A single shared PRNG made seeded runs NON-reproducible, which defeats the
+	// entire point of seeding: goroutines reach the mutex in scheduler-dependent
+	// order, and each call consumes one or two draws depending on whether the drop
+	// check fired, so the stream interleaved differently every run. Measured: the
+	// same seed produced 200 vs 204 sends across runs.
+	//
+	// Per-link streams make each link's sequence a function of the seed alone.
+	links map[string]*rand.Rand
+	seed  int64
 
 	// counters for assertions and for the cluster view.
 	sent    map[raft.NodeID]int
@@ -56,7 +95,8 @@ func NewNetwork(seed int64) *Network {
 		nodes:      make(map[raft.NodeID]*raft.Server),
 		crashed:    make(map[raft.NodeID]bool),
 		partitions: make(map[raft.NodeID]int),
-		rnd:        rand.New(rand.NewSource(seed)),
+		links:      make(map[string]*rand.Rand),
+		seed:       seed,
 		sent:       make(map[raft.NodeID]int),
 		dropped:    make(map[raft.NodeID]int),
 	}
@@ -72,7 +112,7 @@ func (n *Network) Register(id raft.NodeID, s *raft.Server) {
 
 // deliverable reports whether an RPC from -> to should be delivered, and
 // consumes randomness for the drop decision. Caller must not hold n.mu.
-func (n *Network) deliverable(from, to raft.NodeID) (*raft.Server, bool, bool) {
+func (n *Network) deliverable(from, to raft.NodeID) (*raft.Server, bool, bool, time.Duration) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
@@ -81,36 +121,64 @@ func (n *Network) deliverable(from, to raft.NodeID) (*raft.Server, bool, bool) {
 	// A crashed node neither sends nor receives.
 	if n.crashed[from] || n.crashed[to] {
 		n.dropped[from]++
-		return nil, false, false
+		return nil, false, false, 0
 	}
 	// Partitioned nodes cannot reach each other.
 	if n.partitions[from] != n.partitions[to] {
 		n.dropped[from]++
-		return nil, false, false
+		return nil, false, false, 0
 	}
-	// Random loss.
-	if n.dropRate > 0 && n.rnd.Float64() < n.dropRate {
+	// Random loss, drawn from this link's own stream so the result does not
+	// depend on how goroutines interleaved.
+	rnd := n.linkRand(from, to)
+	if n.dropRate > 0 && rnd.Float64() < n.dropRate {
 		n.dropped[from]++
-		return nil, false, false
+		return nil, false, false, 0
 	}
 
 	target, ok := n.nodes[to]
 	if !ok {
-		return nil, false, false
+		return nil, false, false, 0
 	}
 
-	dup := n.duplicateRate > 0 && n.rnd.Float64() < n.duplicateRate
-	return target, true, dup
+	dup := n.duplicateRate > 0 && rnd.Float64() < n.duplicateRate
+
+	// Draw the delay from the same link stream, before releasing the lock.
+	var delay time.Duration
+	if n.latencyMax > 0 {
+		span := int64(n.latencyMax - n.latencyMin)
+		delay = n.latencyMin
+		if span > 0 {
+			delay += time.Duration(rnd.Int63n(span))
+		}
+	}
+	return target, true, dup, delay
+}
+
+// SetLatency sets the simulated one-way delay range applied to every RPC.
+//
+// Zero (the default) preserves the original instant delivery, which keeps the
+// existing fast tests fast. Set a real range to exercise timing behaviour.
+func (n *Network) SetLatency(minD, maxD time.Duration) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.latencyMin, n.latencyMax = minD, maxD
 }
 
 // SendAppendEntries implements raft.Transport.
 func (n *Network) SendAppendEntries(to raft.NodeID, args raft.AppendEntriesArgs) (raft.AppendEntriesReply, error) {
-	target, ok, dup := n.deliverable(args.LeaderID, to)
+	target, ok, dup, delay := n.deliverable(args.LeaderID, to)
 	if !ok {
 		return raft.AppendEntriesReply{}, raft.ErrUnreachable
 	}
+	if delay > 0 {
+		time.Sleep(delay) // outbound flight time
+	}
 
 	reply := target.AppendEntries(args)
+	if delay > 0 {
+		time.Sleep(delay) // return flight time
+	}
 	if dup {
 		// Deliver a second time. The receiver rules must make this a no-op —
 		// this is the duplicate-delivery flow RULES.md rule 3 requires.
@@ -121,12 +189,18 @@ func (n *Network) SendAppendEntries(to raft.NodeID, args raft.AppendEntriesArgs)
 
 // SendRequestVote implements raft.Transport.
 func (n *Network) SendRequestVote(to raft.NodeID, args raft.RequestVoteArgs) (raft.RequestVoteReply, error) {
-	target, ok, dup := n.deliverable(args.CandidateID, to)
+	target, ok, dup, delay := n.deliverable(args.CandidateID, to)
 	if !ok {
 		return raft.RequestVoteReply{}, raft.ErrUnreachable
 	}
+	if delay > 0 {
+		time.Sleep(delay)
+	}
 
 	reply := target.RequestVote(args)
+	if delay > 0 {
+		time.Sleep(delay)
+	}
 	if dup {
 		target.RequestVote(args)
 	}
@@ -134,6 +208,23 @@ func (n *Network) SendRequestVote(to raft.NodeID, args raft.RequestVoteArgs) (ra
 }
 
 // --- Chaos controls -------------------------------------------------------
+
+// linkRand returns the PRNG for one directed link, creating it on first use.
+// Caller must hold n.mu.
+//
+// The per-link seed is derived from the base seed and the endpoint names via
+// FNV-1a, so it is stable across runs and independent of map iteration order.
+func (n *Network) linkRand(from, to raft.NodeID) *rand.Rand {
+	key := string(from) + "->" + string(to)
+	if r, ok := n.links[key]; ok {
+		return r
+	}
+	h := fnv.New64a()
+	h.Write([]byte(key))
+	r := rand.New(rand.NewSource(n.seed ^ int64(h.Sum64())))
+	n.links[key] = r
+	return r
+}
 
 // Crash stops a node from sending or receiving. Models a process death or a
 // machine going away — Chaos Monkey's original fault.

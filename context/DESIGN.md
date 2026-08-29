@@ -512,3 +512,87 @@ The throughput claim needs a real multi-process benchmark over `rpc/` — **outs
       participant forgets its promise on restart. `storage/` exists and is wired for
       Raft, so this is plumbing rather than new design.
 - [ ] Live resharding / rebalancing — LATER.md, deliberately out of scope
+
+
+---
+
+# Production hardening pass (2026-08-29)
+
+Three parallel audits - raft/storage, ledger/2PC, and rpc/node/sim - against the
+"production ready, no compromise" standard. **Every bug below passed the previous
+test suite**, which is the point: the suite proved the happy path and ordinary
+recovery, while the adversarial half was missing.
+
+The unifying defect across all three areas: **"this shouldn't happen" branches
+returned success or guessed**, instead of failing loudly. For a system whose
+governing invariant is that no scenario may create or destroy a cent, that default
+is inverted.
+
+## Money bugs (each reproduced, fixed, and covered by a regression test)
+
+| Bug | Consequence |
+|---|---|
+| Recovery guessed ABORT when it could not *reach* the coordinator | Unilaterally reversed committed transactions - debit stood, credit never landed |
+| Outcome applied for a transaction a shard never prepared | Credit applied unconditionally while debit no-opped: money created |
+| CommitDebit returned OK holding no reservation | A missing debit leg reported success |
+| A later prepare erased a durable COMMIT decision | An aborted transaction id became reusable |
+| PrepareDebit ignored account/amount on a duplicate txID | A second prepare claimed a larger sum against a smaller hold |
+| Internal 2PC keys shared the client idempotency namespace | A client key of tx9:credit swallowed a real credit leg |
+| No overflow checks | Depositing onto MaxInt64 wrapped a balance negative |
+| **Idempotency key not bound to its request** | A withdrawal from bob returned ok=true carrying **alice's** balance; the client records a debit that never happened |
+
+## Safety and availability bugs
+
+- **RaftState.Save could destroy all persistent state.** Truncate-then-append left
+  a window where the file was durably EMPTY. The comment above it claimed this was
+  safe because "a node that loses its state is indistinguishable from a brand-new
+  node" - wrong, and the most dangerous line in the codebase. A brand-new node has
+  a new identity; a node that keeps its id but forgets votedFor grants a second
+  vote in a term it already voted in. Now an atomic write-temp / fsync / rename /
+  fsync-dir.
+- **PHANTOM QUORUM.** A shut-down node kept voting and acking over the leader's
+  cached connection, so a lone leader committed and told the customer their money
+  moved against a quorum that no longer existed. raft.Server now latches stopped;
+  rpc.Server.Close closes established connections and waits.
+- **Single-node clusters could never elect a leader** - the vote tally was only
+  checked inside a per-peer goroutine.
+- **-peers accepted duplicate ids, missing ports, empty ids.** A one-character typo
+  produced a cluster that reported healthy, tolerated zero failures, and could
+  later have committed entries overwritten.
+- **RPC timeout (500ms) exceeded the election timeout (150-300ms)** - the section
+  5.2 inequality inverted, guaranteeing spurious elections. Timings are now flags,
+  validated at startup.
+- **Transport dialed while holding the shared mutex**, so one dead peer stalled
+  every other peer's RPCs (measured: 2.95s to a healthy peer). And **dropping on
+  timeout killed concurrent healthy calls** on the shared connection (91/200).
+
+## Simulator honesty
+
+- **Fault selection is now reproducible** (per-link PRNGs). It previously used one
+  shared PRNG reached in scheduler-dependent order, so even the fault pattern
+  differed between runs of the same seed.
+- **Full run reproducibility is NOT achieved and is no longer claimed.** Election
+  timers run on wall-clock time, so RPC counts still vary ~2% between runs of one
+  seed. Closing that needs a logical-time discrete-event scheduler - a substantial
+  redesign, recorded as outstanding rather than papered over.
+- **Latency is now modelled** (SetLatency). Zero-latency delivery is why the
+  transport bugs above were invisible to the suite. New test: with the timing
+  inequality deliberately violated, terms churned to 25 while Election Safety and
+  Log Matching held - timing costs liveness, never safety, exactly as the paper says.
+
+## Still outstanding
+
+- [ ] Multi-process **sharded** deployment. node/ runs one Raft group; a sharded
+      cluster needs shard-multiplexed RPC (a wire-format change), a real
+      shard.Group over the network, and a durably-placed coordinator. A substantial
+      piece of work, not wiring.
+- [ ] The sharded write-throughput benchmark (needs the above).
+- [ ] **Auth and TLS.** Both ports are unauthenticated plaintext gob: anyone who
+      can reach them can read every balance and inject AppendEntries. The single
+      highest-risk gap for a banking system.
+- [ ] Metrics, health/readiness endpoints, structured logging.
+- [ ] Snapshotting and log compaction (section 7). RaftState.Save rewrites the
+      whole log per persist - measured O(n^2): 481x write amplification at 800
+      entries. The hard scalability wall.
+- [ ] Membership changes (section 6) - no node replacement without full downtime.
+- [ ] Rate limiting / backpressure; graceful shutdown draining.
