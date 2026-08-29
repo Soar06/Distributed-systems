@@ -160,5 +160,9 @@ core-bank/
 
 - [x] Repo created, `fe/bank-app` and `fe/cluster-dashboard` static mockups in place
       (mock data, no backend wiring yet).
-- Currently in scoping stage. Next step once repo exists: Phase 1, starting with
-  Raft state machine design + double-entry ledger domain model.
+- [x] Phase 1 design spec written — see **[DESIGN.md](DESIGN.md)** (Raft state
+      machine per Figure 2 + double-entry ledger domain model). Design only; no
+      implementation.
+- Phase 1 implementation **not started**: there is no `go.mod` and no Go source in
+  the repo yet. Next step: `go.mod` + `raft/` types and role loop, tested against a
+  trivial state machine before the ledger is wired in.
