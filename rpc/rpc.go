@@ -46,6 +46,14 @@ type Server struct {
 
 	mu     sync.Mutex
 	closed bool
+
+	// conns tracks accepted connections so Close can actually close them.
+	//
+	// Closing only the listener left established connections serving RPCs
+	// indefinitely: a node "shut down" for a rolling restart kept answering
+	// AppendEntries over the leader's cached connection, so the leader committed
+	// against a quorum that no longer existed.
+	conns map[net.Conn]struct{}
 }
 
 // Listen starts an RPC server for the given Raft server on addr.
@@ -65,7 +73,7 @@ func Listen(addr string, raftSrv *raft.Server, client *ClientService) (*Server, 
 		return nil, fmt.Errorf("rpc: listen %s: %w", addr, err)
 	}
 
-	s := &Server{rpcSrv: r, listener: l}
+	s := &Server{rpcSrv: r, listener: l, conns: make(map[net.Conn]struct{})}
 	s.wg.Add(1)
 	go s.serve()
 	return s, nil
@@ -84,14 +92,39 @@ func (s *Server) serve() {
 			}
 			continue
 		}
-		go s.rpcSrv.ServeConn(conn)
+		s.mu.Lock()
+		if s.closed {
+			// Raced with Close: refuse the connection rather than serving it.
+			s.mu.Unlock()
+			conn.Close()
+			return
+		}
+		s.conns[conn] = struct{}{}
+		s.mu.Unlock()
+
+		s.wg.Add(1)
+		go func(c net.Conn) {
+			defer s.wg.Done()
+			defer func() {
+				s.mu.Lock()
+				delete(s.conns, c)
+				s.mu.Unlock()
+				c.Close()
+			}()
+			s.rpcSrv.ServeConn(c)
+		}(conn)
 	}
 }
 
 // Addr returns the address actually bound, useful when addr specified port 0.
 func (s *Server) Addr() string { return s.listener.Addr().String() }
 
-// Close stops the server.
+// Close stops the server: it stops accepting, closes every established
+// connection, and waits for all handlers to finish.
+//
+// Closing only the listener is not enough. Established connections keep serving,
+// and for a consensus RPC server that means a shut-down node keeps voting and
+// acking replication — a phantom quorum.
 func (s *Server) Close() error {
 	s.mu.Lock()
 	if s.closed {
@@ -99,9 +132,16 @@ func (s *Server) Close() error {
 		return nil
 	}
 	s.closed = true
+	conns := make([]net.Conn, 0, len(s.conns))
+	for c := range s.conns {
+		conns = append(conns, c)
+	}
 	s.mu.Unlock()
 
 	err := s.listener.Close()
+	for _, c := range conns {
+		c.Close() // unblocks the ServeConn goroutine parked on Read
+	}
 	s.wg.Wait()
 	return err
 }

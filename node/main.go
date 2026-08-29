@@ -14,12 +14,10 @@ package main
 
 import (
 	"flag"
-	"fmt"
 	"log"
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strings"
 	"syscall"
 	"time"
 
@@ -36,6 +34,15 @@ func main() {
 		peerList = flag.String("peers", "", "comma-separated id=host:port list, including this node")
 		dataDir  = flag.String("data", "./data", "directory for the write-ahead log")
 		seed     = flag.Int64("seed", 0, "random seed for election timers (0 = derive from id)")
+
+		// Timing must be tunable: a WAN deployment cannot use LAN defaults, and
+		// the RPC timeout must stay well under the election timeout (§5.2's
+		// broadcastTime << electionTimeout).
+		rpcTimeout  = flag.Duration("rpc-timeout", 100*time.Millisecond, "per-RPC timeout; must be < election-min")
+		electionMin = flag.Duration("election-min", 150*time.Millisecond, "minimum election timeout")
+		electionMax = flag.Duration("election-max", 300*time.Millisecond, "maximum election timeout")
+		heartbeat   = flag.Duration("heartbeat", 50*time.Millisecond, "leader heartbeat interval")
+		allowSolo   = flag.Bool("allow-single-node", false, "permit a single-node cluster (no fault tolerance)")
 	)
 	flag.Parse()
 
@@ -44,12 +51,30 @@ func main() {
 		os.Exit(2)
 	}
 
-	addrs, ids, err := parsePeers(*peerList)
+	addrs, ids, err := rpc.ParsePeers(*peerList)
 	if err != nil {
 		log.Fatalf("node: %v", err)
 	}
 	if _, ok := addrs[raft.NodeID(*id)]; !ok {
 		log.Fatalf("node: -id %q is not in -peers", *id)
+	}
+	if len(ids) < 3 && !*allowSolo {
+		log.Fatalf("node: %d peer(s) configured; a cluster needs at least 3 to tolerate "+
+			"a single failure. Pass -allow-single-node to override for local testing.", len(ids))
+	}
+
+	// §5.2 requires broadcastTime << electionTimeout. If an RPC can outlive the
+	// election timeout, followers start elections while the leader is still
+	// waiting on a single call — leadership churn under mild degradation.
+	if *rpcTimeout >= *electionMin {
+		log.Fatalf("node: -rpc-timeout (%v) must be well below -election-min (%v); "+
+			"otherwise a single slow RPC triggers spurious elections", *rpcTimeout, *electionMin)
+	}
+	if *electionMin >= *electionMax {
+		log.Fatalf("node: -election-min (%v) must be below -election-max (%v)", *electionMin, *electionMax)
+	}
+	if *heartbeat >= *electionMin {
+		log.Fatalf("node: -heartbeat (%v) must be well below -election-min (%v)", *heartbeat, *electionMin)
 	}
 
 	// Durable state. Each node gets its own file: nodes share no storage, even on
@@ -78,10 +103,15 @@ func main() {
 		}
 	}
 
-	transport := rpc.NewTransport(addrs, 500*time.Millisecond)
+	transport := rpc.NewTransport(addrs, *rpcTimeout)
 	defer transport.Close()
 
-	srv := raft.NewServerWith(raft.NodeID(*id), ids, machine, transport, raft.DefaultConfig(), s)
+	cfg := raft.Config{
+		ElectionTimeoutMin: electionMin.Milliseconds(),
+		ElectionTimeoutMax: electionMax.Milliseconds(),
+		HeartbeatInterval:  heartbeat.Milliseconds(),
+	}
+	srv := raft.NewServerWith(raft.NodeID(*id), ids, machine, transport, cfg, s)
 	srv.SetStorage(storage.OpenRaftState(walPath, appliedFile))
 
 	// Recover anything this node durably knew before it last stopped.
@@ -103,47 +133,43 @@ func main() {
 		*id, rpcServer.Addr(), len(ids), walPath)
 
 	// Report role changes, so watching a terminal shows elections happening.
-	go reportRole(srv)
+	roleDone := make(chan struct{})
+	go reportRole(srv, roleDone)
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	<-sigCh
 	log.Printf("node %s shutting down", *id)
+	close(roleDone)
+
+	// Ordered shutdown. The deferred closes run afterwards in LIFO order, but
+	// leadership must be given up first so clients are redirected rather than
+	// left waiting on a node that is going away.
+	srv.Stop()
+	rpcServer.Close()
 }
 
-// parsePeers turns "n1=host:port,n2=host:port" into a map and an id list.
-func parsePeers(s string) (map[raft.NodeID]string, []raft.NodeID, error) {
-	addrs := make(map[raft.NodeID]string)
-	var ids []raft.NodeID
-
-	for _, part := range strings.Split(s, ",") {
-		part = strings.TrimSpace(part)
-		if part == "" {
-			continue
-		}
-		id, addr, ok := strings.Cut(part, "=")
-		if !ok {
-			return nil, nil, fmt.Errorf("bad peer %q, want id=host:port", part)
-		}
-		addrs[raft.NodeID(id)] = addr
-		ids = append(ids, raft.NodeID(id))
-	}
-	if len(ids) == 0 {
-		return nil, nil, fmt.Errorf("no peers given")
-	}
-	return addrs, ids, nil
-}
-
-// reportRole logs role transitions.
-func reportRole(s *raft.Server) {
+// reportRole logs role transitions until done is closed.
+//
+// It takes the server mutex on every poll, so it must not outlive the process's
+// useful life: it was previously an infinite loop with no stop channel, taxing
+// the same lock the role loop and every AppendEntries handler contend for.
+func reportRole(s *raft.Server, done <-chan struct{}) {
 	last := raft.Role(-1)
 	lastTerm := raft.Term(0)
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+
 	for {
-		role, term := s.Role(), s.CurrentTerm()
-		if role != last || term != lastTerm {
-			log.Printf("  %s: %v (term %d, commit %d)", s.ID(), role, term, s.CommitIndex())
-			last, lastTerm = role, term
+		select {
+		case <-done:
+			return
+		case <-ticker.C:
+			role, term := s.Role(), s.CurrentTerm()
+			if role != last || term != lastTerm {
+				log.Printf("  %s: %v (term %d, commit %d)", s.ID(), role, term, s.CommitIndex())
+				last, lastTerm = role, term
+			}
 		}
-		time.Sleep(50 * time.Millisecond)
 	}
 }

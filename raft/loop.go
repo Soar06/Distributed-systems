@@ -40,6 +40,7 @@ func (s *Server) Stop() {
 		return
 	}
 	s.running = false
+	s.stopped = true // latched: this node no longer participates in consensus
 	close(s.stopCh)
 	s.mu.Unlock()
 
@@ -399,7 +400,7 @@ func (s *Server) advanceCommitIndexLocked() {
 // — a non-leader must reject and redirect, never accept a write (NOW.md).
 func (s *Server) Submit(cmd []byte) (Index, Term, bool) {
 	s.mu.Lock()
-	if s.role != Leader {
+	if s.role != Leader || s.stopped {
 		s.mu.Unlock()
 		return 0, 0, false
 	}

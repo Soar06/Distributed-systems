@@ -17,8 +17,10 @@
 package ledger
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"sort"
 	"strings"
 	"sync"
@@ -111,7 +113,31 @@ var (
 	ErrInvalidAmount     = errors.New("amount must be positive")
 	ErrSameAccount       = errors.New("cannot transfer to the same account")
 	ErrMissingKey        = errors.New("idempotency key required")
+
+	// ErrIdempotencyConflict means the key was already used for a DIFFERENT
+	// request. The caller must not treat this as either success or as a plain
+	// failure of the new request: it means the key is not usable here.
+	ErrIdempotencyConflict = errors.New("idempotency key already used for a different request")
 )
+
+// fingerprint is a digest of the fields that define what a command DOES.
+//
+// The idempotency key is deliberately excluded: the question this answers is
+// "is this the same operation?", and the key is how the operation is being
+// identified, not part of what it does.
+func (c Command) fingerprint() uint64 {
+	h := fnv.New64a()
+	var b [8]byte
+	b[0] = byte(c.Op)
+	h.Write(b[:1])
+	h.Write([]byte(c.From))
+	h.Write([]byte{0})
+	h.Write([]byte(c.To))
+	h.Write([]byte{0})
+	binary.LittleEndian.PutUint64(b[:], uint64(c.Amount))
+	h.Write(b[:])
+	return h.Sum64()
+}
 
 // Entry is one half of a double-entry pair: a single debit or credit against one
 // account.
@@ -176,6 +202,13 @@ type State struct {
 	// returns the original answer instead of performing the operation twice.
 	applied map[string]Result
 
+	// fingerprints maps idempotency key -> a digest of the request that first
+	// used it. A key is only a valid retry token for the SAME request; without
+	// this check a reused key returned the FIRST request's result for a totally
+	// different operation, so a client recorded a successful debit against an
+	// account whose money never moved.
+	fingerprints map[string]uint64
+
 	// history is the append-only record of what happened. This is the
 	// event-sourced ledger of DESIGN.md §6 in its Phase 1 form.
 	history []Transaction
@@ -191,9 +224,10 @@ type State struct {
 // New returns an empty ledger.
 func New() *State {
 	return &State{
-		balances: make(map[AccountID]Money),
-		applied:  make(map[string]Result),
-		reserves: make(map[string]Reserve),
+		balances:     make(map[AccountID]Money),
+		applied:      make(map[string]Result),
+		reserves:     make(map[string]Reserve),
+		fingerprints: make(map[string]uint64),
 	}
 }
 
@@ -218,12 +252,22 @@ func (s *State) Apply(cmd Command) Result {
 	// Retry path: return the original result without re-executing. This must come
 	// before every other check, so a retried command that would now fail (because
 	// the balance has since changed) still returns its original success.
+	//
+	// But a key is only a retry token for the SAME request. Returning the cached
+	// result for a DIFFERENT operation forges a success: a withdrawal from one
+	// account would come back OK carrying another account's balance, and the
+	// client would record a debit that never happened.
+	fp := cmd.fingerprint()
 	if prev, seen := s.applied[cmd.IdempotencyKey]; seen {
+		if s.fingerprints[cmd.IdempotencyKey] != fp {
+			return Result{Err: ErrIdempotencyConflict.Error()}
+		}
 		return prev
 	}
 
 	res := s.applyLocked(cmd)
 	s.applied[cmd.IdempotencyKey] = res
+	s.fingerprints[cmd.IdempotencyKey] = fp
 	return res
 }
 

@@ -34,6 +34,18 @@ type TxReply struct {
 	// NotLeader and LeaderAddr implement the §8 redirect.
 	NotLeader  bool
 	LeaderAddr string
+
+	// Conflict means the idempotency key was already used for a DIFFERENT
+	// request. This is neither a success nor an ordinary failure of the new
+	// request: the key cannot be used here, and the caller must not retry it
+	// unchanged.
+	Conflict bool
+
+	// Indeterminate means the outcome is UNKNOWN, not failed: the entry may yet
+	// commit. A client must retry with the same idempotency key rather than
+	// recording a failure — treating this as "did not happen" is how a real
+	// transfer gets double-sent or wrongly reversed.
+	Indeterminate bool
 }
 
 // BalanceArgs requests one account's balance.
@@ -115,8 +127,18 @@ func (c *ClientService) Submit(args TxArgs, reply *TxReply) error {
 	}
 
 	// A retry of an already-applied command returns the original result without
-	// going through the log again.
-	if res, ok := c.machine.Result(cmd.IdempotencyKey); ok {
+	// going through the log again — but ONLY if the key was first used for this
+	// same request.
+	//
+	// Without that check, reusing a key returned the FIRST request's result for a
+	// completely different operation: a withdrawal from one account came back
+	// ok=true carrying another account's balance, so the client recorded a debit
+	// that never happened. A false success is worse than a false failure.
+	if res, ok, err := c.machine.ResultFor(cmd); err != nil {
+		reply.Err = err.Error()
+		reply.Conflict = true
+		return nil
+	} else if ok {
 		reply.OK, reply.Err, reply.Balance = res.OK, res.Err, int64(res.Balance)
 		return nil
 	}
@@ -129,30 +151,51 @@ func (c *ClientService) Submit(args TxArgs, reply *TxReply) error {
 		return nil
 	}
 
-	// Wait for the entry to be applied.
-	deadline := time.Now().Add(c.commitTimeout)
-	for time.Now().Before(deadline) {
-		if c.raftSrv.LastApplied() >= idx {
+	// Wait for the entry to be applied, event-driven rather than polling.
+	//
+	// The previous version busy-waited at 2ms, taking the raft mutex twice per
+	// iteration for up to the full timeout. Under concurrent load that put client
+	// goroutines in direct contention with the consensus loop for the same lock,
+	// so client traffic degraded consensus itself.
+	applied := c.raftSrv.WaitApplied(idx)
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+	deadline := time.After(c.commitTimeout)
+
+	for {
+		select {
+		case <-applied:
 			if res, ok := c.machine.Result(cmd.IdempotencyKey); ok {
 				reply.OK, reply.Err, reply.Balance = res.OK, res.Err, int64(res.Balance)
 				return nil
 			}
-		}
-		// Losing leadership mid-flight means the entry may never commit here.
-		if _, still := c.raftSrv.LeaderID(); !still {
-			reply.NotLeader = true
-			reply.LeaderAddr = c.leaderAddr()
-			reply.Err = "leadership lost before commit; retry with the same idempotency key"
+			// Applied but no result recorded: the entry at this index was replaced
+			// by a different leader's entry. Indeterminate, same as a timeout.
+			reply.Indeterminate = true
+			reply.Err = "entry was superseded before it committed; retry with the same idempotency key"
+			return nil
+
+		case <-ticker.C:
+			// Losing leadership means our entry may never commit here. Checked on a
+			// slow tick rather than a hot loop.
+			if _, still := c.raftSrv.LeaderID(); !still {
+				reply.NotLeader = true
+				reply.LeaderAddr = c.leaderAddr()
+				reply.Indeterminate = true
+				reply.Err = "leadership lost before commit; retry with the same idempotency key"
+				return nil
+			}
+
+		case <-deadline:
+			// Timing out does NOT mean the write failed — the entry is in the
+			// leader's log and may still commit. Flagged as INDETERMINATE so a
+			// client does not record it as a failure; retrying with the same
+			// idempotency key is safe and is exactly why the key exists.
+			reply.Indeterminate = true
+			reply.Err = "timed out waiting for commit; retry with the same idempotency key"
 			return nil
 		}
-		time.Sleep(2 * time.Millisecond)
 	}
-
-	// Timing out does NOT mean the write failed — it may still commit. The client
-	// must retry with the same idempotency key, which is exactly why that key
-	// exists.
-	reply.Err = "timed out waiting for commit; retry with the same idempotency key"
-	return nil
 }
 
 // Balance handles a read.

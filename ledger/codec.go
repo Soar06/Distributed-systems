@@ -104,11 +104,20 @@ type Machine struct {
 	// entry commits.
 	mu      sync.Mutex
 	results map[string]Result
+
+	// fingerprints binds each idempotency key to the request that first used it,
+	// so a replay with a different operation is rejected rather than answered
+	// with the original request's result.
+	fingerprints map[string]uint64
 }
 
 // NewMachine wraps a ledger state.
 func NewMachine(s *State) *Machine {
-	return &Machine{State: s, results: make(map[string]Result)}
+	return &Machine{
+		State:        s,
+		results:      make(map[string]Result),
+		fingerprints: make(map[string]uint64),
+	}
 }
 
 // Apply implements raft.StateMachine.
@@ -126,14 +135,39 @@ func (m *Machine) Apply(cmd []byte) any {
 
 	m.mu.Lock()
 	m.results[c.IdempotencyKey] = res
+	m.fingerprints[c.IdempotencyKey] = c.fingerprint()
 	m.mu.Unlock()
 	return res
 }
 
 // Result returns the recorded result for an idempotency key.
+//
+// Deprecated: prefer ResultFor, which also verifies the key belongs to the same
+// request. Returning a cached result without that check forges a success for a
+// different operation.
 func (m *Machine) Result(key string) (Result, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	r, ok := m.results[key]
 	return r, ok
+}
+
+// ResultFor returns the recorded result for a command's idempotency key, but
+// only if the key was first used for THIS same request.
+//
+// Returns (result, true, nil) on a genuine retry, (_, false, nil) when the key
+// is unknown, and (_, false, ErrIdempotencyConflict) when the key was used for a
+// different request.
+func (m *Machine) ResultFor(cmd Command) (Result, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	r, ok := m.results[cmd.IdempotencyKey]
+	if !ok {
+		return Result{}, false, nil
+	}
+	if m.fingerprints[cmd.IdempotencyKey] != cmd.fingerprint() {
+		return Result{}, false, ErrIdempotencyConflict
+	}
+	return r, true, nil
 }

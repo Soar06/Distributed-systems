@@ -60,6 +60,11 @@ type Server struct {
 	heartbeatDeadline time.Time
 
 	running bool
+
+	// stopped latches true on Stop and never clears. running only tracks whether
+	// the role loop goroutine is live; stopped is the durable statement that this
+	// node has left the cluster and must no longer be counted toward any quorum.
+	stopped bool
 	stopCh  chan struct{}
 	wg      sync.WaitGroup
 
@@ -176,16 +181,6 @@ func (s *Server) LastApplied() Index {
 	return s.lastApplied
 }
 
-// recordAppliedError notes a failure to persist the applied marker. Kept as
-// state rather than logged directly so the surrounding process can decide how to
-// surface it (metrics, logs, health check) without this package choosing.
-func (s *Server) recordAppliedError(err error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.appliedErrs++
-	s.lastAppliedErr = err
-}
-
 // AppliedPersistFailures returns how many times the applied marker failed to
 // persist, and the most recent error. A non-zero count means restarts will replay
 // more of the log than necessary, and that storage is unhealthy.
@@ -243,6 +238,17 @@ func (s *Server) observeTerm(t Term) bool {
 func (s *Server) AppendEntries(args AppendEntriesArgs) AppendEntriesReply {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// A stopped node must not participate in consensus.
+	//
+	// Without this, a node shut down for a rolling restart kept ACKING
+	// replication over the leader's already-open connection: the leader counted
+	// it toward the majority, committed, and told the client the money moved —
+	// against a quorum that no longer existed. The entry survived on one disk.
+	// The deploy looked healthy right up until the processes actually exited.
+	if s.stopped {
+		return AppendEntriesReply{Term: s.currentTerm, Success: false}
+	}
 
 	// Rule 1: reject a stale leader without touching our log.
 	if args.Term < s.currentTerm {
@@ -308,6 +314,11 @@ func (s *Server) AppendEntries(args AppendEntriesArgs) AppendEntriesReply {
 func (s *Server) RequestVote(args RequestVoteArgs) RequestVoteReply {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// A stopped node must not vote: see AppendEntries.
+	if s.stopped {
+		return RequestVoteReply{Term: s.currentTerm, VoteGranted: false}
+	}
 
 	// Rule 1.
 	if args.Term < s.currentTerm {
@@ -381,15 +392,17 @@ func (s *Server) applyCommitted() {
 	// because replaying is idempotent. But it must not be silently ignored either:
 	// the failure is recorded so an operator can see storage degrading.
 	//
-	// The write is handed to a background goroutine so its fsync does not run on
-	// the hot path while s.mu is held.
+	// Written inline. An earlier version handed this to a background goroutine to
+	// keep the fsync off the lock, but that raced shutdown: a node stopped
+	// promptly after applying could exit before the marker was written, so the
+	// restart replayed from a stale index and lost 2PC decisions. Correctness of
+	// the recovery path outranks the latency saving; the marker write is a small
+	// fixed-size file.
 	if as, ok := s.storage.(AppliedStorage); ok && s.lastApplied > 0 {
-		idx := uint64(s.lastApplied)
-		go func() {
-			if err := as.SaveApplied(idx); err != nil {
-				s.recordAppliedError(err)
-			}
-		}()
+		if err := as.SaveApplied(uint64(s.lastApplied)); err != nil {
+			s.appliedErrs++
+			s.lastAppliedErr = err
+		}
 	}
 
 	s.signalApplied()
