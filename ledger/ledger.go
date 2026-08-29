@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 )
 
@@ -41,6 +42,15 @@ func (m Money) String() string {
 	}
 	return s
 }
+
+// maxMoney is the largest representable amount. Used for overflow checks: a
+// balance that wraps negative would create money out of nothing.
+const maxMoney = Money(1<<63 - 1)
+
+// internalKeyPrefix marks idempotency keys generated internally by the 2PC
+// machinery. Client-supplied keys carrying this prefix are rejected, so a client
+// cannot forge or pre-empt an internal bookkeeping entry.
+const internalKeyPrefix = "!2pc!:"
 
 // AccountID identifies an account.
 type AccountID string
@@ -199,6 +209,11 @@ func (s *State) Apply(cmd Command) Result {
 	if cmd.IdempotencyKey == "" {
 		return Result{Err: ErrMissingKey.Error()}
 	}
+	if strings.HasPrefix(cmd.IdempotencyKey, internalKeyPrefix) {
+		// A client must not be able to write into the 2PC bookkeeping namespace:
+		// doing so could mark a transfer leg as already applied and destroy money.
+		return Result{Err: "idempotency key uses a reserved internal prefix"}
+	}
 
 	// Retry path: return the original result without re-executing. This must come
 	// before every other check, so a retried command that would now fail (because
@@ -232,6 +247,9 @@ func (s *State) applyLocked(cmd Command) Result {
 		}
 		if _, exists := s.balances[cmd.To]; !exists {
 			return Result{Err: ErrNoSuchAccount.Error()}
+		}
+		if s.balances[cmd.To] > maxMoney-cmd.Amount {
+			return Result{Err: "deposit would overflow the account balance"}
 		}
 		s.balances[cmd.To] += cmd.Amount
 		s.record(cmd, []Entry{{Account: cmd.To, Amount: cmd.Amount}})
@@ -279,6 +297,9 @@ func (s *State) applyLocked(cmd Command) Result {
 		}
 		if from < cmd.Amount {
 			return Result{Err: ErrInsufficientFunds.Error(), Balance: from}
+		}
+		if s.balances[cmd.To] > maxMoney-cmd.Amount {
+			return Result{Err: "transfer would overflow the destination balance"}
 		}
 		s.balances[cmd.From] -= cmd.Amount
 		s.balances[cmd.To] += cmd.Amount

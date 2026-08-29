@@ -24,6 +24,23 @@ type Storage interface {
 	Load() ([]byte, error)
 }
 
+// AppliedStorage is an optional extension for durably recording how far the state
+// machine has been applied.
+//
+// Figure 2 makes commitIndex and lastApplied volatile, and a node re-learns its
+// commit index from the leader. But a state machine holding state a client has
+// already been told about — a committed transfer, a 2PC promise — cannot simply
+// start empty and wait: between restart and the leader's next AppendEntries, the
+// node would answer reads from nothing. Recording lastApplied lets Restore replay
+// the log deterministically and come back with the same state it had.
+// The index is a plain uint64 rather than raft.Index so that storage
+// implementations need not import this package — the dependency stays
+// one-directional, raft -> storage, never the reverse.
+type AppliedStorage interface {
+	SaveApplied(index uint64) error
+	LoadApplied() (uint64, error)
+}
+
 // encodeState serializes persistent state.
 //
 // Format: [8 term][1 hasVote][2 voteLen][vote][8 entryCount], then per entry
@@ -197,8 +214,51 @@ func (s *Server) Restore() error {
 	s.currentTerm = term
 	s.votedFor = votedFor
 	s.log = log
+	s.role = Follower
+
+	// Figure 2: commitIndex and lastApplied are volatile and restart at 0. The
+	// node re-learns its commit index from the leader.
 	s.commitIndex = 0
 	s.lastApplied = 0
-	s.role = Follower
+
+	// Rebuild the state machine by replaying the log up to where it had previously
+	// been applied. §7 describes exactly this — snapshotting exists *because*
+	// "as the log grows longer, it occupies more space and takes more time to
+	// replay", which presumes replay is how a restarted node recovers.
+	//
+	// This is safe precisely because applying the same log in the same order is
+	// deterministic. Without it, a restarted node's ledger and its 2PC promises
+	// start empty: a participant that voted YES would forget it, and the funds it
+	// reserved would become spendable again while the transaction is still live.
+	if as, ok := s.storage.(AppliedStorage); ok && s.sm != nil {
+		raw, err := as.LoadApplied()
+		if err != nil {
+			return err
+		}
+		prevApplied := Index(raw)
+		if prevApplied > s.lastIndex() {
+			// The log is shorter than what we claim to have applied. That should be
+			// impossible — entries are persisted before they are applied — so treat
+			// it as corruption rather than silently replaying a prefix.
+			return fmt.Errorf("raft: persisted lastApplied %d exceeds log length %d",
+				prevApplied, s.lastIndex())
+		}
+		for i := Index(1); i <= prevApplied; i++ {
+			e, ok := s.entryAt(i)
+			if !ok {
+				return fmt.Errorf("raft: missing log entry %d during replay", i)
+			}
+			if e.Command == nil {
+				continue // a no-op entry carries nothing to apply
+			}
+			if ism, ok := s.sm.(IndexedStateMachine); ok {
+				ism.ApplyAt(e.Index, e.Command)
+			} else {
+				s.sm.Apply(e.Command)
+			}
+		}
+		s.commitIndex = prevApplied
+		s.lastApplied = prevApplied
+	}
 	return nil
 }

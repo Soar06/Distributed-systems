@@ -36,6 +36,9 @@ const headerSize = 8
 // huge allocation.
 const maxRecordSize = 64 << 20 // 64 MiB
 
+// checksum is the shared CRC32 used by the WAL and the applied-index file.
+func checksum(b []byte) uint32 { return crc32.ChecksumIEEE(b) }
+
 // WAL is an append-only write-ahead log on disk.
 //
 // All writes are followed by fsync before returning. That is what makes the

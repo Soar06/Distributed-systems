@@ -61,6 +61,16 @@ func main() {
 	}
 	defer wal.Close()
 
+	// Records how far the state machine has been applied, so a restart replays the
+	// log and comes back with the same ledger rather than an empty one. Without it
+	// a restarted node serves reads from nothing until the leader catches it up.
+	appliedPath := filepath.Join(*dataDir, *id+".applied")
+	appliedFile, err := storage.OpenApplied(appliedPath)
+	if err != nil {
+		log.Fatalf("node: open applied index: %v", err)
+	}
+	defer appliedFile.Close()
+
 	// The ledger is the replicated state machine.
 	state := ledger.New()
 	machine := ledger.NewMachine(state)
@@ -77,7 +87,7 @@ func main() {
 	defer transport.Close()
 
 	srv := raft.NewServerWith(raft.NodeID(*id), ids, machine, transport, raft.DefaultConfig(), s)
-	srv.SetStorage(storage.NewRaftState(wal))
+	srv.SetStorage(storage.NewRaftStateWithApplied(wal, appliedFile))
 
 	// Recover anything this node durably knew before it last stopped.
 	if err := srv.Restore(); err != nil {

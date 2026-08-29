@@ -119,9 +119,14 @@ func (c *Coordinator) twoPhase(txID TxID, cmd ledger.Command, fromShard, toShard
 	// vote is durable before it is reported, so a crashed participant wakes up
 	// still bound by its promise.
 
+	// The debit shard is the coordinator (Spanner: "one of the participant groups
+	// is chosen as the coordinator"), named explicitly on every record so recovery
+	// never has to infer it from slice position.
+	coordinator := fromShard
+
 	debitVote, isLeader, err := debitGroup.Propose(Command{
 		Op: OpPrepare, TxID: txID, Ledger: cmd,
-		Debit: true, Participants: participants,
+		Debit: true, Participants: participants, Coordinator: coordinator,
 	}, c.prepareTimeout)
 	if err != nil || !isLeader {
 		// Could not even record our own vote: nothing was promised, so aborting is
@@ -132,18 +137,18 @@ func (c *Coordinator) twoPhase(txID TxID, cmd ledger.Command, fromShard, toShard
 	if !debitVote.OK {
 		// The debit side voted NO — insufficient funds, most commonly. Abort, and
 		// tell the credit side so it does not wait.
-		c.decide(txID, cmd, participants, false, debitGroup, creditGroup)
+		c.decide(txID, cmd, participants, coordinator, false, debitGroup, creditGroup)
 		return debitVote, ErrTxAborted
 	}
 
 	creditVote, isLeader, err := creditGroup.Propose(Command{
 		Op: OpPrepare, TxID: txID, Ledger: cmd,
-		Debit: false, Participants: participants,
+		Debit: false, Participants: participants, Coordinator: coordinator,
 	}, c.prepareTimeout)
 	if err != nil || !isLeader || !creditVote.OK {
 		// The credit side did not vote yes. The debit side HAS reserved funds, so
 		// they must be released — this is exactly what the abort path exists for.
-		c.decide(txID, cmd, participants, false, debitGroup, creditGroup)
+		c.decide(txID, cmd, participants, coordinator, false, debitGroup, creditGroup)
 		if !creditVote.OK && creditVote.Err != "" {
 			return creditVote, ErrTxAborted
 		}
@@ -156,7 +161,7 @@ func (c *Coordinator) twoPhase(txID TxID, cmd ledger.Command, fromShard, toShard
 	// the coordinator's Raft group FIRST: once that entry commits, the outcome is
 	// permanent even if the coordinator dies immediately afterwards.
 
-	if err := c.decide(txID, cmd, participants, true, debitGroup, creditGroup); err != nil {
+	if err := c.decide(txID, cmd, participants, coordinator, true, debitGroup, creditGroup); err != nil {
 		// The decision could not be recorded or delivered. Participants that voted
 		// yes are now in doubt — correctly refusing to guess. Recovery resolves
 		// them; see RecoverInDoubt.
@@ -169,14 +174,14 @@ func (c *Coordinator) twoPhase(txID TxID, cmd ledger.Command, fromShard, toShard
 
 // decide logs the coordinator's decision and delivers it to participants.
 func (c *Coordinator) decide(txID TxID, cmd ledger.Command, participants []ID,
-	commit bool, debitGroup, creditGroup Group) error {
+	coordinator ID, commit bool, debitGroup, creditGroup Group) error {
 
 	// Step 1: the coordinator records the decision in its OWN Raft log. This is
 	// the durability point — after this the outcome cannot change, and a
 	// replacement coordinator leader can recover it.
 	if _, isLeader, err := debitGroup.Propose(Command{
 		Op: OpDecision, TxID: txID, Ledger: cmd,
-		Commit: commit, Debit: true, Participants: participants,
+		Commit: commit, Debit: true, Participants: participants, Coordinator: coordinator,
 	}, c.commitTimeout); err != nil || !isLeader {
 		return fmt.Errorf("shard: could not log decision for %s: %v", txID, err)
 	}
@@ -187,13 +192,13 @@ func (c *Coordinator) decide(txID TxID, cmd ledger.Command, participants []ID,
 	var firstErr error
 	if _, _, err := debitGroup.Propose(Command{
 		Op: OpOutcome, TxID: txID, Ledger: cmd,
-		Commit: commit, Debit: true, Participants: participants,
+		Commit: commit, Debit: true, Participants: participants, Coordinator: coordinator,
 	}, c.commitTimeout); err != nil {
 		firstErr = err
 	}
 	if _, _, err := creditGroup.Propose(Command{
 		Op: OpOutcome, TxID: txID, Ledger: cmd,
-		Commit: commit, Debit: false, Participants: participants,
+		Commit: commit, Debit: false, Participants: participants, Coordinator: coordinator,
 	}, c.commitTimeout); err != nil && firstErr == nil {
 		firstErr = err
 	}
@@ -210,6 +215,9 @@ func (c *Coordinator) decide(txID TxID, cmd ledger.Command, participants []ID,
 // If the coordinator genuinely never logged a decision, the transaction is aborted:
 // safe, because no participant can have committed without a decision existing.
 func (c *Coordinator) RecoverInDoubt() (resolved int, err error) {
+	var blocked int
+	var firstErr error
+
 	for shardID, g := range c.groups {
 		if !g.IsLeader() {
 			continue // only a leader may propose on behalf of its group
@@ -221,29 +229,65 @@ func (c *Coordinator) RecoverInDoubt() (resolved int, err error) {
 				continue
 			}
 
-			// Ask the coordinator group (the debit shard) for the outcome.
-			var commit, known bool
-			if len(rec.Participants) > 0 {
-				coordID := rec.Participants[0] // by construction the debit shard
-				if cg, ok := c.groups[coordID]; ok {
-					commit, known = cg.Machine().Decision(txID)
-				}
+			// Ask the coordinator group for the outcome.
+			//
+			// THREE outcomes must be distinguished, and conflating them destroys
+			// money. "I cannot reach the coordinator" is not "no decision exists":
+			// the coordinator's Raft group may hold a durable COMMIT that this node
+			// simply cannot see. Aborting on that guess unilaterally reverses a
+			// committed transaction — the debit stands and the credit never lands.
+			coordID := rec.Coordinator
+			if coordID == "" && len(rec.Participants) > 0 {
+				// Legacy records written before Coordinator was explicit.
+				coordID = rec.Participants[0]
+			}
+			if coordID == "" {
+				// We do not know who to ask. Staying blocked is correct: 2PC is a
+				// blocking protocol and this is exactly the case it blocks for.
+				blocked++
+				continue
 			}
 
+			cg, reachable := c.groups[coordID]
+			if !reachable || !cg.IsLeader() {
+				// Coordinator group unreachable or has no leader we can query. Stay
+				// blocked and retry later. This is the inherent blocking of 2PC
+				// (§12), not a failure to handle.
+				blocked++
+				continue
+			}
+
+			commit, known := cg.Machine().Decision(txID)
 			if !known {
-				// No decision was ever recorded, so no participant can have
-				// committed. Aborting is the safe resolution.
+				// The coordinator group IS reachable and has NO decision recorded.
+				// Only now is abort safe: with no decision in the coordinator's log,
+				// no participant can have been told to commit.
 				commit = false
 			}
 
 			if _, _, err := g.Propose(Command{
 				Op: OpOutcome, TxID: txID, Ledger: rec.Cmd,
-				Commit: commit, Debit: rec.Debit, Participants: rec.Participants,
+				Commit: commit, Debit: rec.Debit,
+				Participants: rec.Participants, Coordinator: coordID,
 			}, c.commitTimeout); err != nil {
-				return resolved, fmt.Errorf("shard: recovering %s on %s: %w", txID, shardID, err)
+				// Record and continue rather than abandoning the remaining shards:
+				// one unrecoverable transaction must not block every other one.
+				firstErr = fmt.Errorf("shard: recovering %s on %s: %w", txID, shardID, err)
+				blocked++
+				continue
 			}
 			resolved++
 		}
+	}
+
+	if firstErr != nil {
+		return resolved, firstErr
+	}
+	if blocked > 0 {
+		// Report honestly that transactions remain unresolved. A caller that treats
+		// a nil error as "everything is settled" would be wrong.
+		return resolved, fmt.Errorf("%w: %d transaction(s) still blocked awaiting a reachable coordinator",
+			ErrInDoubt, blocked)
 	}
 	return resolved, nil
 }

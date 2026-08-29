@@ -10,11 +10,38 @@ package storage
 // simple version is proven.
 type RaftState struct {
 	wal *WAL
+
+	// applied optionally records how far the state machine has been applied, so a
+	// restart can replay the log and come back with the same state rather than an
+	// empty one. Nil means the feature is not in use.
+	applied *AppliedFile
 }
 
 // NewRaftState wraps a WAL.
 func NewRaftState(w *WAL) *RaftState {
 	return &RaftState{wal: w}
+}
+
+// NewRaftStateWithApplied wraps a WAL and an applied-index file, making the
+// result satisfy raft.AppliedStorage as well as raft.Storage.
+func NewRaftStateWithApplied(w *WAL, a *AppliedFile) *RaftState {
+	return &RaftState{wal: w, applied: a}
+}
+
+// SaveApplied implements raft.AppliedStorage.
+func (r *RaftState) SaveApplied(index uint64) error {
+	if r.applied == nil {
+		return nil
+	}
+	return r.applied.Save(index)
+}
+
+// LoadApplied implements raft.AppliedStorage.
+func (r *RaftState) LoadApplied() (uint64, error) {
+	if r.applied == nil {
+		return 0, nil
+	}
+	return r.applied.Load()
 }
 
 // Save durably records the state, replacing anything previously stored.
@@ -43,5 +70,10 @@ func (r *RaftState) Load() ([]byte, error) {
 	return records[len(records)-1], nil
 }
 
-// Close closes the underlying WAL.
-func (r *RaftState) Close() error { return r.wal.Close() }
+// Close closes the underlying WAL and applied-index file.
+func (r *RaftState) Close() error {
+	if r.applied != nil {
+		_ = r.applied.Close()
+	}
+	return r.wal.Close()
+}

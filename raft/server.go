@@ -345,5 +345,15 @@ func (s *Server) applyCommitted() {
 			}
 		}
 	}
+
+	// Record how far we have applied, so a restart can replay to the same point.
+	// Written after the entries are applied: if we crash between applying and
+	// recording, replay redoes the tail, which is safe because applying the same
+	// log in the same order is deterministic and the state machine's own
+	// idempotency keys absorb the repeat.
+	if as, ok := s.storage.(AppliedStorage); ok && s.lastApplied > 0 {
+		_ = as.SaveApplied(uint64(s.lastApplied))
+	}
+
 	s.signalApplied()
 }

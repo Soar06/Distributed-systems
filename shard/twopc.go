@@ -99,6 +99,14 @@ type Command struct {
 	// Participants lists every shard in the transaction. The coordinator needs
 	// this in its decision record so a replacement leader knows who to notify.
 	Participants []ID
+
+	// Coordinator names the shard acting as coordinator for this transaction.
+	//
+	// This is explicit rather than inferred from Participants[0]: positional
+	// convention is not validated anywhere, and several code paths legitimately
+	// build records with an empty Participants slice. Recovery must be able to ask
+	// a NAMED group for the decision, never guess from slice order.
+	Coordinator ID
 }
 
 // TxRecord is the durable state of one distributed transaction at one shard.
@@ -111,6 +119,7 @@ type TxRecord struct {
 	Cmd          ledger.Command
 	Debit        bool
 	Participants []ID
+	Coordinator  ID
 
 	// Decided records the coordinator's decision once known.
 	Decided bool
@@ -140,6 +149,7 @@ func (c Command) Encode() []byte {
 	for _, p := range c.Participants {
 		buf = appendStr(buf, string(p))
 	}
+	buf = appendStr(buf, string(c.Coordinator))
 
 	return append(buf, c.Ledger.Encode()...)
 }
@@ -179,6 +189,12 @@ func DecodeCommand(data []byte) (Command, error) {
 		c.Participants = append(c.Participants, ID(p))
 		pos = n
 	}
+
+	coord, pos, err := readStr(data, pos)
+	if err != nil {
+		return Command{}, err
+	}
+	c.Coordinator = ID(coord)
 
 	lc, err := ledger.Decode(data[pos:])
 	if err != nil {

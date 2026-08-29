@@ -2,6 +2,16 @@ package ledger
 
 import "fmt"
 
+// internalKey namespaces 2PC bookkeeping keys away from client-supplied
+// idempotency keys, which share the same map. A client that chose the key
+// "tx9:credit" would otherwise mark tx9's real credit leg as already applied.
+//
+// The prefix is rejected on any client-supplied key (see Apply), so the two
+// namespaces cannot collide.
+func internalKey(txID, leg string) string {
+	return internalKeyPrefix + txID + ":" + leg
+}
+
 // Fund reservation, for cross-shard transfers (Phase 2).
 //
 // A cross-shard transfer cannot debit and credit atomically — the two accounts
@@ -82,7 +92,17 @@ func (s *State) PrepareDebit(txID string, account AccountID, amount Money) Resul
 
 	// Idempotent: re-preparing an already-prepared transaction is a no-op, since
 	// the prepare RPC may legitimately be retried.
-	if _, held := s.reserves[txID]; held {
+	//
+	// But the retry must be for the SAME transaction. Returning OK for a different
+	// account or amount meant a second prepare could claim a far larger sum while
+	// only the original, smaller hold existed — the coordinator would then credit
+	// the larger amount against it.
+	if held, ok := s.reserves[txID]; ok {
+		if held.Account != account || held.Amount != amount {
+			return Result{Err: fmt.Sprintf(
+				"reservation %s already holds %s for %s; refusing to rebind to %s for %s",
+				txID, held.Amount, held.Account, amount, account)}
+		}
 		avail, _ := s.availableLocked(account)
 		return Result{OK: true, Balance: avail}
 	}
@@ -122,16 +142,21 @@ func (s *State) CommitDebit(txID string) Result {
 
 	r, held := s.reserves[txID]
 	if !held {
-		// Already committed (a duplicate delivery), or never prepared here.
-		// Idempotent by design: the decision may be delivered more than once.
-		return Result{OK: true}
+		// No reservation. Either this was already committed (a duplicate delivery,
+		// which the caller's phase check absorbs before reaching here), or this
+		// shard never prepared the transaction at all.
+		//
+		// Reporting OK for the second case is how a missing debit leg turned into
+		// created money: the credit side applied while the debit silently did
+		// nothing. The caller must distinguish, so report the failure.
+		return Result{Err: fmt.Sprintf("no reservation held for transaction %s", txID)}
 	}
 
 	s.balances[r.Account] -= r.Amount
 	delete(s.reserves, txID)
 	s.record(Command{
 		Op:             OpTransfer,
-		IdempotencyKey: txID + ":debit",
+		IdempotencyKey: internalKey(txID, "debit"),
 		From:           r.Account,
 		Amount:         r.Amount,
 	}, []Entry{{Account: r.Account, Amount: -r.Amount}})
@@ -144,13 +169,20 @@ func (s *State) CommitCredit(txID string, account AccountID, amount Money) Resul
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	key := txID + ":credit"
+	// Internal 2PC bookkeeping keys are namespaced away from client-supplied
+	// idempotency keys. Sharing the namespace meant a client key of "tx9:credit"
+	// would swallow the real credit leg of tx9 — debit applied, credit never did,
+	// money destroyed.
+	key := internalKey(txID, "credit")
 	if prev, done := s.applied[key]; done {
 		return prev // idempotent: the decision may arrive twice
 	}
 
 	if _, exists := s.balances[account]; !exists {
 		return Result{Err: ErrNoSuchAccount.Error()}
+	}
+	if s.balances[account] > maxMoney-amount {
+		return Result{Err: "credit would overflow the account balance"}
 	}
 	s.balances[account] += amount
 	s.record(Command{

@@ -153,6 +153,15 @@ func (s *Server) startElection() {
 		resolved bool
 	)
 
+	// A single-node cluster is its own majority: the self-vote already wins, and
+	// there are no peers to ask. Without this the election never resolves, because
+	// the tally below is only ever checked inside a per-peer goroutine — so a
+	// one-node cluster could never elect a leader or make any progress at all.
+	if votes >= needed {
+		s.becomeLeader(term)
+		return
+	}
+
 	for _, p := range peers {
 		if p == me {
 			continue
