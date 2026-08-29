@@ -128,9 +128,24 @@ type Transaction struct {
 // Deposits and withdrawals are the deliberate exception: money genuinely enters
 // or leaves the system at the boundary. A full bank would balance those against a
 // cash/vault account; modelling that is Phase 3 work (see context/DESIGN.md §6).
+//
+// CROSS-SHARD transfers are the other exception, and the reason is structural
+// rather than a shortcut. When the debit and credit accounts live in different
+// Raft groups, neither group's local history can hold a zero-summing pair — the
+// other half is, by construction, in a different log. Each side is booked against
+// an implicit settlement account, which is exactly how correspondent banking
+// handles a transfer between two institutions: each books its own leg, and the
+// nostro/vostro accounts reconcile. Conservation is therefore a GLOBAL invariant
+// across all shards (ShardCluster.TotalMoney), not a per-shard one.
+//
+// Transactions carrying a single entry are these one-legged settlement postings;
+// a same-shard transfer still books both legs and must still sum to zero.
 func (t Transaction) balances() bool {
 	if t.Op != OpTransfer {
 		return true
+	}
+	if len(t.Entries) == 1 {
+		return true // one leg of a cross-shard transfer; see above
 	}
 	var sum Money
 	for _, e := range t.Entries {
@@ -155,6 +170,11 @@ type State struct {
 	// event-sourced ledger of DESIGN.md §6 in its Phase 1 form.
 	history []Transaction
 
+	// reserves holds funds promised to in-flight cross-shard transactions
+	// (Phase 2, see reserve.go). Reserved money stays in the balance but is not
+	// available to spend.
+	reserves map[string]Reserve
+
 	seq uint64
 }
 
@@ -163,6 +183,7 @@ func New() *State {
 	return &State{
 		balances: make(map[AccountID]Money),
 		applied:  make(map[string]Result),
+		reserves: make(map[string]Reserve),
 	}
 }
 
@@ -220,7 +241,7 @@ func (s *State) applyLocked(cmd Command) Result {
 		if cmd.Amount <= 0 {
 			return Result{Err: ErrInvalidAmount.Error()}
 		}
-		bal, exists := s.balances[cmd.From]
+		_, exists := s.balances[cmd.From]
 		if !exists {
 			return Result{Err: ErrNoSuchAccount.Error()}
 		}
@@ -229,6 +250,11 @@ func (s *State) applyLocked(cmd Command) Result {
 		// serialized by the log: the first sees the original balance, the second
 		// sees the reduced one. Only one can win. This is linearizability doing
 		// its job, not a lock.
+		//
+		// Phase 2: checked against AVAILABLE, not raw balance — money already
+		// promised to an in-flight cross-shard transfer must not be spendable
+		// here, or it would be spent twice.
+		bal, _ := s.availableLocked(cmd.From)
 		if bal < cmd.Amount {
 			return Result{Err: ErrInsufficientFunds.Error(), Balance: bal}
 		}
@@ -243,10 +269,11 @@ func (s *State) applyLocked(cmd Command) Result {
 		if cmd.From == cmd.To {
 			return Result{Err: ErrSameAccount.Error()}
 		}
-		from, ok := s.balances[cmd.From]
+		_, ok := s.balances[cmd.From]
 		if !ok {
 			return Result{Err: ErrNoSuchAccount.Error()}
 		}
+		from, _ := s.availableLocked(cmd.From)
 		if _, ok := s.balances[cmd.To]; !ok {
 			return Result{Err: ErrNoSuchAccount.Error()}
 		}

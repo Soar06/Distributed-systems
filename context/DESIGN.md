@@ -5,7 +5,8 @@ The concrete design for **what is being built right now**. Scope vs spec:
 being built is actually specified — states, transitions, message shapes, structures,
 invariants. Read NOW.md to decide what to work on; read this while writing the Go.
 
-**Current phase: Phase 1 — single replicated ledger (consensus core).**
+**Current phase: Phase 2 — sharding + cross-shard transfers.** (Phase 1 complete; its
+spec is retained below as the record of what was built.)
 
 Source of truth for everything Raft below: Ongaro & Ousterhout, *"In Search of an
 Understandable Consensus Algorithm (Extended Version)"*, tech report published
@@ -351,3 +352,114 @@ no consensus code.
 **Known limitation:** `storage.RaftState.Save` rewrites the entire state on every
 persist. Correct but O(log size) per append — fine at Phase 1 scale, and the
 reason log compaction is a real LATER.md item rather than a nicety.
+
+---
+
+# Phase 2 — Sharding + cross-shard transfers
+
+Phase 1 measured the constraint it exists to fix: **3 nodes = 119.9 tx/s, 5 nodes =
+105.9 tx/s.** Every write funnels through one leader, so replicas buy fault tolerance,
+never write throughput. Sharding is the only thing that adds write capacity, because
+independent shards have independent leaders committing in parallel.
+
+Theory logged in [learn/READING_LIST.md](../learn/READING_LIST.md) §11 (sharding /
+consistent hashing) and §12 (2PC), both before this design, per RULES.md rule 1.
+
+## 9. Shard topology
+
+A **shard** is one independent Raft group with its own leader, its own log, its own
+WAL files, and its own slice of the accounts. Nothing is shared between shards but the
+network.
+
+```
+   shard-0 (Raft group)      shard-1 (Raft group)
+   n0a  n0b  n0c             n1a  n1b  n1c
+    ^ own leader, own log     ^ own leader, own log
+    └── accounts hashing here └── accounts hashing here
+```
+
+**[project decision] Fixed shard count for Phase 2.** This is not a shortcut — it is
+what real systems do at this layer: Spanner and CockroachDB separate *placement* from
+the *transaction protocol*, and rebalancing is its own subsystem. Live resharding is a
+LATER.md item, recorded rather than faked. Consistent hashing is still implemented,
+because it is the correct structure and it is what the dashboard's ring view renders.
+
+## 10. Placement: consistent hashing
+
+Keys and shards are mapped onto a 2^32 ring. An account belongs to the first shard
+clockwise from `hash(accountID)`.
+
+Naive `hash % N` is rejected for the reason §11 gives: changing N remaps nearly every
+key, which for a bank means relocating nearly every account at once.
+
+**Virtual nodes are required, not optional.** A handful of shards placed once on the
+ring divides it very unevenly; each shard therefore gets many virtual points
+(`vnodes`), which is what makes the distribution roughly even. Dynamo's design.
+
+Determinism requirement: placement must be a pure function of `(accountID, ring
+config)`. Every node must independently agree on who owns what, with no coordination —
+otherwise two nodes disagree about which shard is authoritative for an account, which
+is a correctness bug, not a performance one.
+
+## 11. Cross-shard transfers: 2PC over Raft
+
+A transfer within one shard stays a single Raft commit — unchanged from Phase 1. A
+transfer *across* shards touches two independent logs, and each could commit its half
+while the other fails. That is the problem 2PC solves.
+
+**We implement Spanner's shape exactly** (§12, quoted from the OSDI 2012 paper),
+substituting Raft for Paxos:
+
+- **No external coordinator process.** *"One of the participant groups is chosen as
+  the coordinator."* The debit shard's leader takes the role.
+- **Participants log a prepare record through Raft** — *"logs a prepare record through
+  Paxos"*. The vote is a replicated log entry, durable before it is sent. A `yes` vote
+  is an unretractable promise, so it must survive the voter crashing.
+- **The coordinator logs the commit/abort decision through Raft** — *"The coordinator
+  leader then logs a commit record through Paxos (or an abort if it timed out)"*.
+- **Participants log the outcome through Raft** — *"Each participant leader logs the
+  transaction's outcome through Paxos."*
+
+Nothing about the 2PC state lives in memory. That is the whole point: an in-memory
+coordinator cannot survive the failure the protocol exists to handle.
+
+### The blocking problem is demonstrated, not hidden
+
+If the coordinator crashes after participants voted `yes` but before the decision is
+delivered, those participants are **in doubt**: holding funds reserved, unable to
+commit or abort unilaterally. This is inherent to 2PC, not a bug (§12, Bernstein ch.7).
+
+Two things follow, and both are Phase 2 deliverables:
+1. **Recovery works.** The coordinator's replacement leader reads the decision from
+   its own Raft log and re-delivers it. An in-doubt participant can also query the
+   coordinator group for the outcome.
+2. **A chaos test proves the window exists** — kill the coordinator mid-protocol,
+   observe participants correctly refusing to guess, then observe recovery resolving
+   them. Hiding this would misrepresent 2PC.
+
+### Reserved funds, not locks
+
+The debit is **reserved** at prepare time (deducted from available balance, not yet
+committed), so a concurrent transfer cannot spend the same money. On commit the
+reservation becomes a real debit; on abort it is released. This is the double-entry
+model extended over two shards — money is never in two places, and never in neither.
+
+## 12. Money conservation across shards
+
+The Phase 1 invariant `TotalMoney()` must now hold **across all shards combined**,
+including while transfers are mid-flight. A transfer in the prepare state has money
+reserved on the debit side and not yet credited — the sum must still be correct, which
+means reserved funds count toward the total until the transfer resolves.
+
+This is the single most important assertion in Phase 2: no chaos scenario, at any
+point, may create or destroy a cent.
+
+## 13. Phase 2 status
+
+- [ ] `shard/` — consistent hash ring with virtual nodes
+- [ ] Multi-group cluster (several Raft groups, one process per node per group)
+- [ ] Intra-shard transfers (single Raft commit, unchanged)
+- [ ] 2PC over Raft: prepare / commit / abort as replicated log entries
+- [ ] Coordinator crash recovery + in-doubt resolution
+- [ ] Chaos: coordinator killed mid-protocol, participant killed after voting yes
+- [ ] Cross-shard money-conservation assertion under chaos

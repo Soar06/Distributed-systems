@@ -378,7 +378,46 @@ with compensating actions to undo. NOW.md deliberately rejects sagas as the prim
 path for money, since a compensation is a *new* transaction, not a rollback — the
 intermediate wrong state was really visible. Logged here as the road not taken.
 
+**How Spanner actually does it** (verified against the OSDI 2012 paper, quoted). This
+is the design Phase 2 implements, because it is what a real system does:
+
+> "One of the participant groups is chosen as the coordinator: the participant leader
+> of that group will be referred to as the coordinator leader."
+
+So there is **no external coordinator process** — one of the shards involved in the
+transfer takes the role. Then:
+
+> "A non-coordinator-participant leader first acquires write locks. It then chooses a
+> prepare timestamp... and **logs a prepare record through Paxos**."
+
+> "The coordinator leader also first acquires write locks, but skips the prepare
+> phase... The coordinator leader then **logs a commit record through Paxos** (or an
+> abort if it timed out while waiting on the other participants)."
+
+> "After commit wait, the coordinator sends the commit timestamp to the client and all
+> other participant leaders. **Each participant leader logs the transaction's outcome
+> through Paxos.**"
+
+And the reason this matters, stated directly:
+
+> "Some authors have claimed that general two-phase commit is too expensive to
+> support, because of the performance or availability problems that it brings.
+> **Running two-phase commit over Paxos mitigates the availability problems.**"
+
+**[project decision]** We implement exactly this shape, substituting Raft for Paxos:
+every 2PC state transition — prepare vote, commit/abort decision, and outcome — is a
+replicated log entry in the relevant Raft group, never in-memory state. A coordinator
+that crashes is replaced by its own group's next leader, which recovers the decision
+from its log. An in-memory coordinator would be a toy: it could not survive the very
+failure the protocol exists to handle.
+
+Note we do **not** implement Spanner's TrueTime/commit-wait. That solves external
+consistency across geographies using hardware clock bounds; Phase 2 is single-machine,
+and the ordering problem it addresses is Phase 3's HLC topic.
+
 **Primary sources:**
+- Corbett et al., *"Spanner: Google's Globally-Distributed Database"* (OSDI 2012),
+  **§2.1 and §4.2.1** — the quotes above; 2PC layered over Paxos groups.
 - Gray, *"Notes on Data Base Operating Systems"* (1978) — where 2PC is first laid out.
 - Bernstein, Hadzilacos & Goodman, *Concurrency Control and Recovery in Database
   Systems* (1987), **Chapter 7** — the rigorous treatment of atomic commitment,
@@ -386,8 +425,6 @@ intermediate wrong state was really visible. Logged here as the road not taken.
 - Kleppmann, *DDIA*, **Chapter 9** ("Consistency and Consensus"), the "Atomic Commit
   and Two-Phase Commit" section — clearest modern explanation, and explicit about
   coordinator failure and in-doubt transactions. Same chapter as [[#2]].
-- Corbett et al., *"Spanner: Google's Globally-Distributed Database"* (OSDI 2012) —
-  2PC layered over Paxos groups; the production shape of what Phase 2 builds.
 - Garcia-Molina & Salem, *"Sagas"* (SIGMOD 1987) — the alternative we are not taking.
 
 ---

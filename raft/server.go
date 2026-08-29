@@ -62,6 +62,42 @@ type Server struct {
 	running bool
 	stopCh  chan struct{}
 	wg      sync.WaitGroup
+
+	// applyWaiters are closed when lastApplied reaches their index. This lets a
+	// caller await its own entry without polling — polling with sleeps made
+	// measured throughput a function of timer granularity rather than of the
+	// system under test.
+	applyWaiters map[Index][]chan struct{}
+}
+
+// WaitApplied returns a channel closed once the entry at idx has been applied.
+func (s *Server) WaitApplied(idx Index) <-chan struct{} {
+	ch := make(chan struct{})
+	s.mu.Lock()
+	if s.lastApplied >= idx {
+		s.mu.Unlock()
+		close(ch)
+		return ch
+	}
+	if s.applyWaiters == nil {
+		s.applyWaiters = make(map[Index][]chan struct{})
+	}
+	s.applyWaiters[idx] = append(s.applyWaiters[idx], ch)
+	s.mu.Unlock()
+	return ch
+}
+
+// signalApplied wakes anyone waiting for indices up to and including
+// s.lastApplied. Caller must hold s.mu.
+func (s *Server) signalApplied() {
+	for idx, chans := range s.applyWaiters {
+		if idx <= s.lastApplied {
+			for _, ch := range chans {
+				close(ch)
+			}
+			delete(s.applyWaiters, idx)
+		}
+	}
 }
 
 // NewServer creates a follower with an empty log, using default timings and no
@@ -302,7 +338,12 @@ func (s *Server) applyCommitted() {
 			return
 		}
 		if s.sm != nil && e.Command != nil {
-			s.sm.Apply(e.Command)
+			if ism, ok := s.sm.(IndexedStateMachine); ok {
+				ism.ApplyAt(e.Index, e.Command)
+			} else {
+				s.sm.Apply(e.Command)
+			}
 		}
 	}
+	s.signalApplied()
 }

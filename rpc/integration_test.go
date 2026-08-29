@@ -139,16 +139,37 @@ func TestEndToEndBanking(t *testing.T) {
 	c := startCluster(t, 3)
 	_, leaderAddr := c.waitLeader(3 * time.Second)
 
+	// Follow leader redirects, exactly as a real client must (§8). The node that
+	// was leader when we looked can be deposed before our write arrives; that is
+	// normal, and the redirect is the supported way to handle it.
 	mustTx := func(args TxArgs) TxReply {
 		t.Helper()
-		var r TxReply
-		if err := call(t, leaderAddr, "Bank.Submit", args, &r); err != nil {
-			t.Fatalf("rpc: %v", err)
+		addr := leaderAddr
+		for attempt := range 5 {
+			var r TxReply
+			if err := call(t, addr, "Bank.Submit", args, &r); err != nil {
+				t.Fatalf("rpc: %v", err)
+			}
+			if r.OK {
+				return r
+			}
+			if r.NotLeader && r.LeaderAddr != "" {
+				addr = r.LeaderAddr
+				leaderAddr = r.LeaderAddr
+				continue
+			}
+			if r.NotLeader {
+				// No leader known yet; wait for the election to settle and retry
+				// with the same idempotency key.
+				time.Sleep(100 * time.Millisecond)
+				_, addr = c.waitLeader(2 * time.Second)
+				leaderAddr = addr
+				continue
+			}
+			t.Fatalf("tx %+v failed on attempt %d: %s", args, attempt, r.Err)
 		}
-		if !r.OK {
-			t.Fatalf("tx %+v failed: %s (notLeader=%v)", args, r.Err, r.NotLeader)
-		}
-		return r
+		t.Fatalf("tx %+v never reached a leader", args)
+		return TxReply{}
 	}
 
 	mustTx(TxArgs{Op: "open", IdempotencyKey: "o1", To: "alice", Amount: 10000})

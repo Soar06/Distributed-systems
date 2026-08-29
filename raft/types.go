@@ -73,6 +73,17 @@ type StateMachine interface {
 	Apply(cmd []byte) any
 }
 
+// IndexedStateMachine is an optional extension: a state machine that also wants
+// to know the log index of the entry being applied.
+//
+// This lets a caller that proposed entry N find out what entry N actually did —
+// "the entry replicated" and "the operation succeeded" are different questions,
+// and a 2PC prepare that votes NO replicates perfectly well.
+type IndexedStateMachine interface {
+	StateMachine
+	ApplyAt(index Index, cmd []byte) any
+}
+
 // Persistent state on all servers (Figure 2).
 //
 // The paper requires this be updated on stable storage BEFORE responding to
