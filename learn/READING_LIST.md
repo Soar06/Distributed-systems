@@ -92,7 +92,44 @@ comparing consensus protocols; not needed to build Phase 1.
 
 ---
 
-## 5. Chaos engineering (Chaos Monkey / Simian Army)
+## 5. Linearizable reads (Raft §8)
+
+**What the theory does:** A read served naively by a leader can return stale data,
+because that leader may already have been deposed by a newer leader it has not yet
+heard from. Linearizability — "each operation appears to execute instantaneously,
+exactly once, at some point between its invocation and its response" (§8) — forbids
+that. The theory says what a *correct* read costs, which is the honest answer to
+"why can't the bank just read the balance quickly."
+
+The paper (§8) requires two precautions for a read that does not go through the log:
+
+1. **The leader must know which entries are committed.** Leader Completeness
+   guarantees it *holds* every committed entry, but at the start of its term it does
+   not know *which* are committed — because the commit rule (§5.4.2) forbids
+   committing a previous term's entry directly. The fix, quoted: *"it needs to commit
+   an entry from its term. Raft handles this by having each leader commit a blank
+   no-op entry into the log at the start of its term."*
+2. **The leader must confirm it has not been deposed**, by exchanging heartbeats with
+   a majority before answering. The paper notes a lease-based alternative but warns
+   it *"would rely on timing for safety (it assumes bounded clock skew)"* — which is
+   why we do not use leases.
+
+§8 also gives the client-side half of exactly-once semantics: *"clients assign unique
+serial numbers to every command,"* and the state machine tracks the latest serial per
+client with its response, answering a repeat without re-executing. That is precisely
+the idempotency-key design in `ledger/`.
+
+**[project decision]** We implement the no-op entry plus the heartbeat-confirmation
+read (ReadIndex), and deliberately **not** lease-based reads: this project's whole
+point is that safety should not depend on clock assumptions. Follower reads are a
+LATER.md item.
+
+**Primary source:** Raft extended tech report §8 ("Client interaction"), plus §5.4.2
+for why a leader may not commit a previous term's entry directly.
+
+---
+
+## 6. Chaos engineering (Chaos Monkey / Simian Army)
 
 **What the theory does:** Inverts how failure is tested. Instead of hoping the
 system survives rare failures and finding out during a real incident, failures are

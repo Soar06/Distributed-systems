@@ -158,18 +158,21 @@ core-bank/
 
 ## Status
 
-- [x] Repo created, `fe/bank-app` and `fe/cluster-dashboard` static mockups in place
-      (mock data, no backend wiring yet).
-- [x] Phase 1 design spec written — see **[DESIGN.md](DESIGN.md)** (Raft state
-      machine per Figure 2 + double-entry ledger domain model).
-- [x] `raft/` implemented and tested: leader election, log replication, commit
-      index, and the full Figure 2 role loop. Go 1.27.
-- [x] `sim/` chaos harness (Netflix Chaos Monkey methodology — see
-      [learn/READING_LIST.md](../learn/READING_LIST.md) §5): deterministic seeded
-      fault injection (crash / partition / packet loss / duplication) with all five
-      Figure 3 safety properties asserted executably. Leader kill, minority-partition
-      split-brain, and healed-partition convergence all covered.
-- Phase 1 **not complete**. Still missing: persistence (`storage/`), gRPC transport
-  (`rpc/`), the ledger domain (`ledger/`), the node binary (`node/`), linearizable
-  reads, and the "more nodes ≠ more write throughput" demo. Nodes are currently
-  in-process objects on a simulated network, not separate OS processes.
+**Phase 1 complete** (2026-08-29). 79 tests passing under `-race`; Go 1.27.
+
+- [x] Phase 1 design spec — [DESIGN.md](DESIGN.md).
+- [x] Consensus core: leader election, log replication, commit index, persistence,
+      linearizable reads. Hand-built from the paper, no Raft library.
+- [x] Ledger: double-entry, integer cents, idempotency keys, determinism.
+- [x] Real separate processes over TCP, each with its own WAL.
+- [x] Chaos harness (`sim/`) with all five Figure 3 safety properties asserted.
+- [x] Demo goal met and measured: 3 nodes = 119.9 tx/s vs 5 nodes = 105.9 tx/s —
+      more replicas did not increase write throughput.
+- [ ] Phase 4 UIs still unwired: `fe/` remains static mockups on fake data. The
+      backend now exposes what they need (`Bank.Status` per node), and the
+      concurrent same-account behavior is settled and proven — the ledger
+      serializes withdrawals through the log, so exactly the available funds can
+      be withdrawn and the balance never goes negative.
+
+Next: Phase 2 (sharding + cross-shard 2PC), or wire the Phase 4 UIs to the live
+cluster.

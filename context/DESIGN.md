@@ -308,22 +308,46 @@ Carried from NOW.md; do **not** resolve these by guesswork:
 
 ## Status
 
-- [x] Phase 1 design written against Figure 2 / Figure 3 of the extended paper.
-- [x] `raft/` — Figure 2 complete: state, both RPC receiver implementations, and the
-      Rules for Servers role loop (randomized election timeouts, candidate
-      elections, leader heartbeats, `nextIndex` decrement-and-retry replication, and
-      the commit rule including the `log[N].term == currentTerm` safety check).
-- [x] `sim/` — deterministic seeded network with fault injection (crash, partition,
-      packet loss, duplication), a cluster harness, and executable assertions for
-      **all five** Figure 3 safety properties. Leader Completeness became testable
-      once elections existed.
-- [x] Cluster view (`sim/view.go`) — per-node role/term/commit/applied/log snapshot,
-      rendered on test failure. Built in the shape NOW.md's Phase 4 dashboard needs,
-      so wiring the UI later is a rendering job, not a redesign.
-- [ ] **Not implemented:** persistence to stable storage (`storage/`), gRPC
-      transport (`rpc/`), the ledger domain (`ledger/`), the node binary (`node/`),
-      and the client API. Raft state is currently in-memory only, so a crash loses
-      votes — Figure 2's "before responding to RPCs" durability requirement is
-      **not yet met**.
-- Next: `storage/` (WAL for persistent state) or `ledger/` (the real state machine),
-  then `rpc/` + `node/` to make nodes separate processes.
+**Phase 1 is complete.** 79 tests pass under `-race` across six packages.
+
+- [x] `raft/` — Figure 2 in full: state, both RPC receivers, the Rules for Servers
+      role loop, randomized election timeouts, `nextIndex` decrement-and-retry
+      replication, and the commit rule with the `log[N].term == currentTerm` check.
+- [x] **Persistence** — `storage/` WAL (length-prefixed, CRC32-checksummed,
+      fsync-before-return) with torn-write detection and truncation on recovery.
+      Every Figure 2 persistent-state mutation is durable *before* the RPC reply.
+      Proven by a test where a node votes, restarts, and refuses to vote again in
+      the same term.
+- [x] **No-op entry on election** (§8) — required, not optional: without it a new
+      leader can never commit entries carried over from a previous term, so a
+      restarted cluster stalls at commit 0. Found by a failing test, fixed against
+      the paper.
+- [x] **Linearizable reads** (§8 ReadIndex) — leader confirms with a majority
+      before answering. Lease-based reads deliberately NOT implemented: they
+      "rely on timing for safety."
+- [x] `ledger/` — accounts, double-entry with a sum-to-zero invariant, integer
+      cents, idempotency keys, and a `VerifyDoubleEntry` audit that re-derives
+      balances from history.
+- [x] `rpc/` + `node/` — nodes are real OS processes over TCP with per-node WALs.
+      Verified by hand: 3 processes elected a leader, moved money, a follower
+      redirected to the leader's real address, the leader process was killed and
+      n2 took over in term 2 with balances intact, then the dead node restarted
+      from its WAL and caught up.
+- [x] **The throughput demo** — measured: 3 nodes = 119.9 tx/s, 5 nodes = 105.9
+      tx/s (88%). Adding replicas made writes *slower*, never faster.
+- [x] `sim/` — chaos harness with all five Figure 3 properties asserted
+      executably, plus crash-and-restart tests that persistence made possible.
+
+**Deliberately not done** (Phase 2+ / LATER.md): sharding and 2PC, HLC,
+snapshotting and log compaction, cluster membership changes, gRPC/protobuf (see
+the `rpc/` note below), TLS, service discovery, follower reads, and the Phase 4
+UIs — the `fe/` mockups are still unwired.
+
+**[project decision] `rpc/` uses net/rpc + gob, not gRPC/protobuf as NOW.md
+specifies.** protoc is an external build dependency and the wire format is not
+what Phase 1 teaches. `raft.Transport` is unchanged, so swapping in gRPC touches
+no consensus code.
+
+**Known limitation:** `storage.RaftState.Save` rewrites the entire state on every
+persist. Correct but O(log size) per append — fine at Phase 1 scale, and the
+reason log compaction is a real LATER.md item rather than a nicety.

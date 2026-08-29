@@ -34,6 +34,10 @@ type Server struct {
 
 	role Role
 
+	// leaderID is the leader this server last heard from, so a follower can tell
+	// a client where to go (§8: a non-leader rejects and redirects).
+	leaderID NodeID
+
 	// sm is the replicated application. Committed entries are applied to it in
 	// log order, exactly once, on every server.
 	sm StateMachine
@@ -43,6 +47,11 @@ type Server struct {
 	cfg       Config
 	transport Transport
 	rnd       *rand.Rand
+
+	// storage persists currentTerm, votedFor, and log[] before RPC replies
+	// (Figure 2). Nil means in-memory only — tests that do not exercise
+	// durability.
+	storage Storage
 
 	// electionDeadline is when this server will start an election if it has not
 	// heard from a leader. heartbeatDeadline is when a leader next sends
@@ -63,6 +72,14 @@ type Server struct {
 // cluster (§5.2). All servers start as followers with term 0 (Figure 2, "State").
 func NewServer(id NodeID, peers []NodeID, sm StateMachine) *Server {
 	return NewServerWith(id, peers, sm, nil, DefaultConfig(), 1)
+}
+
+// SetStorage attaches durable storage. Must be called before Start, and is
+// normally followed by Restore.
+func (s *Server) SetStorage(st Storage) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.storage = st
 }
 
 // NewServerWith creates a server with an explicit transport, timing config, and
@@ -176,10 +193,13 @@ func (s *Server) AppendEntries(args AppendEntriesArgs) AppendEntriesReply {
 	// step down. Note >= rather than >: a candidate that receives AppendEntries
 	// from a leader in the SAME term must also convert to follower (Figure 2,
 	// "Candidates"), since that leader already won this term's election.
-	s.observeTerm(args.Term)
+	termChanged := s.observeTerm(args.Term)
 	if s.role == Candidate && args.Term == s.currentTerm {
 		s.role = Follower
 	}
+
+	// Remember who the leader is so clients can be redirected.
+	s.leaderID = args.LeaderID
 
 	// A valid leader is alive, so do not challenge it: reset the election timer
 	// (Figure 2, "Followers"). This happens even if the log check below fails —
@@ -189,11 +209,23 @@ func (s *Server) AppendEntries(args AppendEntriesArgs) AppendEntriesReply {
 
 	// Rule 2: log consistency check.
 	if !s.matchesPrevLog(args.PrevLogIndex, args.PrevLogTerm) {
+		// Even on rejection, an adopted higher term must be durable before we
+		// reply — otherwise a restart could resurrect the old term and re-vote.
+		if termChanged {
+			s.mustPersistLocked()
+		}
 		return AppendEntriesReply{Term: s.currentTerm, Success: false}
 	}
 
 	// Rules 3 and 4.
-	s.appendFrom(args.PrevLogIndex, args.Entries)
+	changed := s.appendFrom(args.PrevLogIndex, args.Entries)
+
+	// Figure 2: persistent state must be durable BEFORE we reply. A follower that
+	// acknowledges entries it has not durably stored can lose them on restart
+	// while the leader believes they are replicated.
+	if changed || termChanged {
+		s.mustPersistLocked()
+	}
 
 	// Rule 5. The min() matters: the leader's commitIndex may be ahead of what it
 	// has actually sent us, and committing entries we do not hold would break
@@ -224,13 +256,16 @@ func (s *Server) RequestVote(args RequestVoteArgs) RequestVoteReply {
 
 	// All Servers rule: a higher term makes us a follower and clears votedFor,
 	// which is what allows us to vote in this newer term.
-	s.observeTerm(args.Term)
+	termChanged := s.observeTerm(args.Term)
 
 	// Rule 2. Both halves are required: the votedFor check gives at most one vote
 	// per term (Election Safety), and the up-to-date check stops a candidate that
 	// is missing committed entries from winning (Leader Completeness).
 	alreadyVoted := s.votedFor != nil && *s.votedFor != args.CandidateID
 	if alreadyVoted || !s.isUpToDate(args.LastLogIndex, args.LastLogTerm) {
+		if termChanged {
+			s.mustPersistLocked()
+		}
 		return RequestVoteReply{Term: s.currentTerm, VoteGranted: false}
 	}
 
@@ -241,6 +276,11 @@ func (s *Server) RequestVote(args RequestVoteArgs) RequestVoteReply {
 	// vote to candidate" — granting a vote also defers our own election, giving
 	// the candidate we just endorsed time to win.
 	s.resetElectionTimerLocked()
+
+	// THE critical persist. If this vote is not durable before we reply, a crash
+	// and restart can make this server forget it voted and grant a second vote in
+	// the same term — producing two leaders and violating Election Safety.
+	s.mustPersistLocked()
 
 	return RequestVoteReply{Term: s.currentTerm, VoteGranted: true}
 }

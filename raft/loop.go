@@ -125,6 +125,11 @@ func (s *Server) startElection() {
 	s.votedFor = &me
 	s.resetElectionTimerLocked()
 
+	// The new term and self-vote must be durable before any RequestVote goes out:
+	// a crash after campaigning but before persisting could let this server vote
+	// again in the same term after restart.
+	s.mustPersistLocked()
+
 	term := s.currentTerm
 	lastIdx, lastTerm := s.lastIndex(), s.lastTerm()
 	peers := append([]NodeID(nil), s.peers...)
@@ -164,6 +169,7 @@ func (s *Server) startElection() {
 			// not just requests.
 			if reply.Term > s.currentTerm {
 				s.becomeFollower(reply.Term)
+				s.mustPersistLocked()
 				s.mu.Unlock()
 				return
 			}
@@ -204,6 +210,7 @@ func (s *Server) becomeLeader(term Term) {
 	}
 
 	s.role = Leader
+	s.leaderID = s.id
 	next := s.lastIndex() + 1
 	for _, p := range s.peers {
 		s.nextIndex[p] = next
@@ -212,6 +219,23 @@ func (s *Server) becomeLeader(term Term) {
 	// A leader trivially matches its own log; this makes the commit-index
 	// majority count uniform over all peers.
 	s.matchIndex[s.id] = s.lastIndex()
+
+	// §8: "it needs to commit an entry from its term. Raft handles this by having
+	// each leader commit a blank no-op entry into the log at the start of its
+	// term."
+	//
+	// Without this, entries carried over from a previous term can never be
+	// committed by a new leader — §5.4.2 forbids committing a previous term's
+	// entry directly, so nothing would ever advance commitIndex after a failover
+	// until fresh client traffic arrived. A no-op with a nil command commits under
+	// the leader's own term and drags the earlier entries along with it via Log
+	// Matching.
+	idx := s.lastIndex() + 1
+	s.log = append(s.log, LogEntry{Term: s.currentTerm, Index: idx, Command: nil})
+	s.matchIndex[s.id] = idx
+	s.nextIndex[s.id] = idx + 1
+	s.mustPersistLocked()
+	s.advanceCommitIndexLocked() // a single-node cluster commits it immediately
 	s.mu.Unlock()
 
 	// "Upon election: send initial empty AppendEntries RPCs (heartbeat) to each
@@ -293,6 +317,7 @@ func (s *Server) replicateTo(peer NodeID, term Term) {
 	// All Servers rule, applied to a response.
 	if reply.Term > s.currentTerm {
 		s.becomeFollower(reply.Term)
+		s.mustPersistLocked()
 		return
 	}
 	if s.role != Leader || s.currentTerm != term {
@@ -374,6 +399,11 @@ func (s *Server) Submit(cmd []byte) (Index, Term, bool) {
 	term := s.currentTerm
 	s.log = append(s.log, LogEntry{Term: term, Index: idx, Command: cmd})
 	s.matchIndex[s.id] = idx
+
+	// The leader must have the entry durably before counting itself toward the
+	// replication majority — otherwise its own vote for commitment is a promise
+	// it might not keep.
+	s.mustPersistLocked()
 
 	// A single-node cluster commits immediately: it is its own majority.
 	s.advanceCommitIndexLocked()

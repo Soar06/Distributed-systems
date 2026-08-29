@@ -84,7 +84,10 @@ func (s *Server) matchesPrevLog(prevLogIndex Index, prevLogTerm Term) bool {
 // Entries already present and matching are NOT re-appended. This matters because
 // AppendEntries can legitimately be delivered twice (the network may duplicate or
 // reorder), and a naive append would corrupt the log on a retry.
-func (s *Server) appendFrom(prevLogIndex Index, entries []LogEntry) {
+// Returns whether the log was actually modified, so the caller can skip an
+// unnecessary fsync on a pure heartbeat or a duplicate delivery.
+func (s *Server) appendFrom(prevLogIndex Index, entries []LogEntry) bool {
+	changed := false
 	for i, e := range entries {
 		idx := prevLogIndex + Index(i) + 1
 
@@ -96,7 +99,9 @@ func (s *Server) appendFrom(prevLogIndex Index, entries []LogEntry) {
 			s.log = s.log[:idx]
 		}
 		s.log = append(s.log, LogEntry{Term: e.Term, Index: idx, Command: e.Command})
+		changed = true
 	}
+	return changed
 }
 
 // majority returns the number of servers constituting a majority of the full

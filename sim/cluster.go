@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/homura/core-bank/raft"
+	"github.com/homura/core-bank/storage"
 )
 
 // Cluster is a set of Raft servers wired to a simulated Network, plus the
@@ -25,6 +26,10 @@ type Cluster struct {
 	// makes State Machine Safety checkable: the property is about what nodes
 	// have *already applied*, so it cannot be verified from current state alone.
 	history map[raft.NodeID][]string
+
+	// wals holds per-node durable storage, when the cluster was built with
+	// NewClusterWithStorage. Nil for in-memory clusters.
+	wals map[raft.NodeID]*storage.WAL
 }
 
 // CountingSM is a trivial deterministic state machine that records what it
