@@ -158,21 +158,27 @@ core-bank/
 
 ## Status
 
-**Phase 1 complete** (2026-08-29). 79 tests passing under `-race`; Go 1.27.
+**Phase 1 complete. Phase 2 core protocol complete** (2026-08-29). 101 tests under
+`-race`; Go 1.27. Production-hardening pass in progress.
 
-- [x] Phase 1 design spec — [DESIGN.md](DESIGN.md).
-- [x] Consensus core: leader election, log replication, commit index, persistence,
-      linearizable reads. Hand-built from the paper, no Raft library.
-- [x] Ledger: double-entry, integer cents, idempotency keys, determinism.
-- [x] Real separate processes over TCP, each with its own WAL.
-- [x] Chaos harness (`sim/`) with all five Figure 3 safety properties asserted.
-- [x] Demo goal met and measured: 3 nodes = 119.9 tx/s vs 5 nodes = 105.9 tx/s —
-      more replicas did not increase write throughput.
-- [ ] Phase 4 UIs still unwired: `fe/` remains static mockups on fake data. The
-      backend now exposes what they need (`Bank.Status` per node), and the
-      concurrent same-account behavior is settled and proven — the ledger
-      serializes withdrawals through the log, so exactly the available funds can
-      be withdrawn and the balance never goes negative.
-
-Next: Phase 2 (sharding + cross-shard 2PC), or wire the Phase 4 UIs to the live
-cluster.
+- [x] **Phase 1** — consensus core, persistence, ledger, real separate processes over
+      TCP, linearizable reads, chaos harness with all five Figure 3 safety properties.
+      Demo goal measured: 3 nodes = 119.9 tx/s vs 5 nodes = 105.9 tx/s, so more
+      replicas did **not** add write throughput.
+- [x] **Phase 2** — consistent-hash sharding (adding a 5th shard moved 21.9% of keys
+      vs modulo's ~80%), independent Raft groups, and cross-shard 2PC in Spanner's
+      shape: prepare/decision/outcome all replicated log entries, coordinator crash
+      recovery, in-doubt resolution, fund reservation. Money conservation asserted
+      after every transfer.
+- [ ] **Phase 2 remainder** — multi-process sharded deployment; the sharded throughput
+      benchmark (not measurable in-process, see [DESIGN.md](DESIGN.md)); persistence
+      for 2PC state (a prepared participant currently forgets its promise on restart).
+- [ ] **Production hardening** — findings from a multi-agent review of raft/storage,
+      ledger/shard, and rpc/node are being worked through. Tracked in DESIGN.md.
+- [ ] **Phase 3** — HLC. Idempotency, double-entry, and event sourcing were built
+      early, during Phases 1-2.
+- [ ] **Phase 4 UIs** — `fe/` remains static mockups on fake data. The backend now
+      exposes what they need (`Bank.Status` per node), and the concurrent
+      same-account question is settled and proven: the ledger serializes withdrawals
+      through the log, so exactly the available funds can be withdrawn and the
+      balance never goes negative.

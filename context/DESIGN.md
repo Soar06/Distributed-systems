@@ -456,10 +456,59 @@ point, may create or destroy a cent.
 
 ## 13. Phase 2 status
 
-- [ ] `shard/` — consistent hash ring with virtual nodes
-- [ ] Multi-group cluster (several Raft groups, one process per node per group)
-- [ ] Intra-shard transfers (single Raft commit, unchanged)
-- [ ] 2PC over Raft: prepare / commit / abort as replicated log entries
-- [ ] Coordinator crash recovery + in-doubt resolution
-- [ ] Chaos: coordinator killed mid-protocol, participant killed after voting yes
-- [ ] Cross-shard money-conservation assertion under chaos
+**Core protocol complete.** 101 tests pass under `-race` across seven packages.
+
+- [x] `shard/` — consistent hash ring with virtual nodes. Measured against theory:
+      adding a 5th shard moved **21.9%** of keys (theory ~1/5); consistent hashing
+      moved **1096** keys where modulo would move **4011**; virtual nodes cut
+      max/min shard skew from **579.88x to 1.17x**.
+- [x] Multi-group cluster — independent Raft groups, each with its own network, its
+      own leader, and **one state machine per node**.
+- [x] Intra-shard transfers as a single Raft commit, no 2PC.
+- [x] 2PC over Raft in Spanner's shape: prepare, decision, and outcome are each
+      replicated log entries; the debit shard's leader is the coordinator.
+- [x] Coordinator crash recovery and in-doubt resolution — honours a durable COMMIT
+      decision when one was logged, aborts safely when none was.
+- [x] Chaos: coordinator killed mid-protocol, participants correctly blocked, then
+      resolved by recovery.
+- [x] Cross-shard money conservation asserted after **every** transfer.
+
+### Bugs this phase surfaced
+
+1. **Cross-shard double-entry cannot balance per-shard** — the two legs live in
+   different Raft logs by construction. Resolved as correspondent banking does: each
+   side books its leg against an implicit settlement account, and conservation is a
+   **global** invariant. The `VerifyDoubleEntry` panic caught this.
+2. **Every replica shared one state machine** in the harness, so each committed entry
+   applied once per node — a 3x debit on a 3-node shard. Now one ledger per node,
+   which the project's own "nodes share nothing" rule requires anyway.
+3. **`Propose` returned a canned success**, conflating "the entry replicated" with
+   "the operation succeeded" — so every 2PC NO vote read as YES. Fixed by keying
+   results to the applied log index (`raft.IndexedStateMachine`).
+4. **`InDoubt()` excluded decided-but-unapplied transactions**, so recovery skipped
+   exactly those holding a durable COMMIT decision.
+
+### Deliberately NOT claimed: sharded write-throughput numbers
+
+NOW.md predicts sharding adds write capacity where replicas do not. Phase 1 measured
+the second half over real TCP (3 nodes 119.9 tx/s vs 5 nodes 105.9 tx/s).
+
+The first half is **not measurable in this in-process simulator**. Evidence: one shard
+running a fixed workload does ~169k tx/s in a 1-shard cluster and ~55k tx/s in a
+4-shard cluster while the other three shards are **idle**. Idle Raft groups cannot
+slow another group — no shared lock, network, or state machine between them. The
+slowdown is harness overhead: every node runs a 5ms ticker and spawns a goroutine per
+peer per replication round, so scheduling cost grows with total node count.
+
+`TestShardsCommitIndependently` verifies the structural property instead, and it holds
+exactly: 20 writes to shard-0 grew shard-0's log by 20 entries and shard-2's by **0**.
+The throughput claim needs a real multi-process benchmark over `rpc/` — **outstanding**.
+
+### Still outstanding for Phase 2
+
+- [ ] Multi-process sharded deployment over TCP (`node/` currently runs one group)
+- [ ] The real sharded throughput benchmark, per the note above
+- [ ] Persistence for 2PC state — `shard.Machine.txs` is in-memory, so a prepared
+      participant forgets its promise on restart. `storage/` exists and is wired for
+      Raft, so this is plumbing rather than new design.
+- [ ] Live resharding / rebalancing — LATER.md, deliberately out of scope
