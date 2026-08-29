@@ -182,9 +182,220 @@ understanding rather than uptime.
 
 ---
 
+## 7. Write-ahead logging, fsync, and crash recovery
+
+**What the theory does:** Makes a change survive a crash. A write that has only
+reached the OS page cache is *not* durable — a power loss discards it — so the
+system must force it to stable storage (`fsync`) and only then acknowledge. The
+write-ahead rule is: record the intent durably *before* acting on it, so recovery
+can always tell what was promised.
+
+Why it matters here: Figure 2's requirement that persistent state be saved "before
+responding to RPCs" is a WAL discipline, and it is a *safety* requirement, not a
+performance note. A server that grants a vote, crashes, forgets, and votes again in
+the same term produces two leaders — Election Safety gone. Our `storage/` package is
+this theory applied: length-prefixed CRC32-checksummed records, fsync before return,
+and torn-write detection so a half-written record is truncated rather than replayed.
+
+**The specific hazards this theory names, all of which `storage/` handles:**
+- **Torn writes** — a process killed mid-append leaves a partial record;
+  indistinguishable from corruption, so it must be dropped, never replayed.
+- **Checksums** — the only way to tell a good record from a plausible-looking bad
+  one. Length fields alone are not enough; a corrupt length is itself an attack on
+  the reader.
+- **fsync is not free and not optional** — the durability/latency trade-off is real,
+  and skipping it is the most common way a "durable" system silently is not.
+
+**Primary sources:**
+- Kleppmann, *Designing Data-Intensive Applications*, **Chapter 3** ("Storage and
+  Retrieval") — log-structured storage and the crash-recovery argument. Same book as
+  [[#2]]; this is a different chapter.
+- Mohan et al., *"ARIES: A Transaction Recovery Method..."* (1992) — the canonical
+  WAL/recovery paper. Heavier than this project needs, but it is where write-ahead
+  logging is properly specified.
+- Pillai et al., *"All File Systems Are Not Created Equal: On the Complexity of
+  Crafting Crash-Consistent Applications"* (OSDI '14) — an empirical catalogue of how
+  real applications get fsync and crash-consistency wrong. The practical companion.
+- Raft extended paper §2 and Figure 2 ("Updated on stable storage before responding
+  to RPCs") — the requirement as it applies to us.
+
+**[project decision]** `storage.RaftState.Save` rewrites the whole state per persist:
+obviously correct, O(log size) per append. The incremental-records-plus-compaction
+version is the optimization, and it belongs with snapshotting (LATER.md) — not before
+the simple version is proven.
+
+---
+
+## 8. Idempotency and exactly-once semantics
+
+**What the theory does:** Reconciles an uncomfortable fact — a client that does not
+receive a reply *cannot know* whether its request was executed. The network may have
+dropped the request, or executed it and dropped the response. Retrying is therefore
+mandatory and dangerous at the same time. Idempotency keys make a retry safe: the
+server recognizes the repeat and returns the original outcome instead of executing
+again.
+
+Why it matters here: this is the difference between a bank and a broken bank. Raft
+guarantees the *log entry* is not duplicated, but that is not enough — the retry
+arrives as a brand-new client request, and only an application-level key can tie it
+back to the original. §8 is explicit that Raft alone does not give exactly-once:
+
+> "as described so far Raft can execute a command multiple times: for example, if the
+> leader crashes after committing the log entry but before responding to the client,
+> the client will retry the command with a new leader, causing it to be executed a
+> second time. The solution is for clients to assign unique serial numbers to every
+> command. Then, the state machine tracks the latest serial number processed for each
+> client, along with the associated response."
+
+**The subtle rule we implement:** a retry returns the **original** result, even if
+re-evaluating now would give a different answer (the balance may have changed since).
+Re-evaluating on retry would make the outcome depend on *when* the retry arrived —
+non-deterministic, and therefore fatal inside a replicated state machine.
+
+**Primary sources:**
+- Raft extended paper **§8** ("Client interaction") — the quote above; the design we
+  implement in `ledger/`.
+- Kleppmann, *DDIA*, **Chapter 11** ("Stream Processing"), on exactly-once /
+  effectively-once semantics and why end-to-end deduplication is required.
+- Helland, *"Idempotence Is Not a Medical Condition"* (ACM Queue, 2012) — the clearest
+  practical treatment of why at-least-once delivery plus idempotence is the realistic
+  target, rather than true exactly-once delivery.
+
+---
+
+## 9. Event sourcing
+
+**What the theory does:** Stores the append-only sequence of *events* as the system
+of record, and treats current state as a fold over that sequence rather than as the
+primary data. Nothing is updated in place; the history is immutable and complete.
+
+Why it matters here: this is the same structure Raft's log already is, arrived at
+from the domain side. That convergence is the point — NOW.md's Phase 3 note that the
+event-sourced ledger "also doubles as the replication log" is not a coincidence but
+the same idea twice. For a bank it is also simply correct: the audit trail *is* the
+data, and a balance that cannot be re-derived from its transactions is unauditable.
+
+**Status correction:** this was queued as Phase 3 but was in fact implemented in
+Phase 1 — `ledger.State` keeps `history []Transaction` as the record, `Balances()` is
+a cache of the fold, and `VerifyDoubleEntry()` re-derives balances from history to
+prove the cache never drifts. What remains for Phase 3 is hardening, not introducing
+it.
+
+**Primary sources:**
+- Martin Fowler, *"Event Sourcing"* (martinfowler.com, 2005) — the canonical
+  definition.
+- Young, *"CQRS Documents"* — event sourcing paired with CQRS, the read/write split
+  that follows naturally from it.
+- Kleppmann, *DDIA*, **Chapter 11** — event logs as the system of record, and the
+  relationship between event sourcing and change data capture.
+
+---
+
+## 10. Double-entry bookkeeping
+
+**What the theory does:** Records every transaction as matched debits and credits
+that sum to zero, so money can be moved but never created or destroyed by a transfer.
+It is 500-year-old accounting, not distributed systems — logged here because it is the
+domain invariant the whole ledger is built to protect, and because it gives us an
+assertion (`entries sum to zero`) rather than a hope.
+
+Why it matters here: it converts "no money was lost" from a thing we believe into a
+thing the code checks. `ledger.Transaction.balances()` enforces it per transaction and
+panics on violation; `VerifyDoubleEntry()` audits the whole history.
+
+**Primary sources:**
+- Pacioli, *Summa de Arithmetica* (1494) — the original description. Of historical
+  interest; not worth reading for implementation.
+- Martin Kleppmann, *"Accounting for Computer Scientists"* (2011, blog) — the
+  practical bridge: double-entry explained for engineers, in terms of immutable
+  append-only events. The one to actually read.
+
+---
+
+## 11. Sharding and consistent hashing (Phase 2)
+
+**What the theory does:** Splits data across independent groups so the system can
+scale writes. Phase 1 proved the constraint hands-on — 3 nodes 119.9 tx/s vs 5 nodes
+105.9 tx/s — because every write funnels through one leader. Adding replicas buys
+fault tolerance, never write throughput. **Sharding is the only thing that adds write
+capacity**, because separate shards have separate leaders committing in parallel.
+
+Consistent hashing decides *which* shard owns a key. Naive `hash(key) % N` is fatal
+here: changing N remaps nearly every key, which for a bank means moving nearly every
+account at once. Consistent hashing maps both keys and nodes onto a circle, assigning
+each key to "the next server that appears on the circle in clockwise order," so
+"the addition of the nth server only causes 1/n fraction of the BLOBs to relocate."
+
+**Virtual nodes** solve the follow-on problem: a handful of nodes placed randomly on
+a circle divide it unevenly, so some shards get far more keys than others. Virtual
+nodes are "multiple labels which point to a single real server," smoothing the
+distribution.
+
+Real systems using it: Amazon Dynamo, Cassandra, Riak, Akamai, Discord, Couchbase.
+
+**[project decision]** Phase 2 shards by **account ID**, and each shard is its own
+independent Raft group — the design NOW.md names (CockroachDB/Spanner/Vitess do the
+same). Consequence to internalize: a transfer *within* a shard stays a single-group
+Raft commit, while a transfer *across* shards needs atomic commitment across two
+independent logs — which is why 2PC ([[#12]]) is the very next entry.
+
+**Primary sources:**
+- Karger et al., *"Consistent Hashing and Random Trees: Distributed Caching Protocols
+  for Relieving Hot Spots on the World Wide Web"* (MIT, STOC 1997) — the original.
+- DeCandia et al., *"Dynamo: Amazon's Highly Available Key-value Store"* (SOSP 2007)
+  — consistent hashing plus virtual nodes in production, and honest about the
+  trade-offs.
+- Kleppmann, *DDIA*, **Chapter 6** ("Partitioning") — partitioning strategies,
+  rebalancing, and request routing. The most directly useful for building this.
+
+---
+
+## 12. Two-Phase Commit (2PC) — atomic commitment across shards (Phase 2)
+
+**What the theory does:** Makes a transaction spanning several independent systems
+either commit everywhere or abort everywhere — never half. A coordinator asks every
+participant to *prepare* (phase 1); if all vote yes it tells them to *commit*
+(phase 2). A participant that votes yes has made a **promise it cannot retract**, even
+across a crash — which is why its prepare must be durable before it answers.
+
+Why it matters here: once accounts are sharded, moving money from a shard-A account
+to a shard-B account touches two separate Raft groups. Each group can commit its own
+half perfectly and the transfer still be catastrophically wrong — debit committed,
+credit lost. Raft gives atomicity *within* one group; 2PC is what extends it across
+groups.
+
+**The hard part, which is the actual Phase 2 lesson:** 2PC is a **blocking** protocol.
+If the coordinator crashes after participants voted yes but before delivering the
+decision, those participants are stuck holding locks, unable to commit or abort
+unilaterally — the *in-doubt* state NOW.md calls out. This is not an implementation
+bug to fix; it is inherent, and it is why 2PC has the reputation it has. Real systems
+mitigate it by making the coordinator itself fault-tolerant — in our case, by
+replicating the coordinator's decisions through Raft, which is exactly what Spanner
+and CockroachDB do.
+
+**Sagas** are the eventual-consistency alternative: a sequence of local transactions
+with compensating actions to undo. NOW.md deliberately rejects sagas as the primary
+path for money, since a compensation is a *new* transaction, not a rollback — the
+intermediate wrong state was really visible. Logged here as the road not taken.
+
+**Primary sources:**
+- Gray, *"Notes on Data Base Operating Systems"* (1978) — where 2PC is first laid out.
+- Bernstein, Hadzilacos & Goodman, *Concurrency Control and Recovery in Database
+  Systems* (1987), **Chapter 7** — the rigorous treatment of atomic commitment,
+  including why the blocking problem is unavoidable.
+- Kleppmann, *DDIA*, **Chapter 9** ("Consistency and Consensus"), the "Atomic Commit
+  and Two-Phase Commit" section — clearest modern explanation, and explicit about
+  coordinator failure and in-doubt transactions. Same chapter as [[#2]].
+- Corbett et al., *"Spanner: Google's Globally-Distributed Database"* (OSDI 2012) —
+  2PC layered over Paxos groups; the production shape of what Phase 2 builds.
+- Garcia-Molina & Salem, *"Sagas"* (SIGMOD 1987) — the alternative we are not taking.
+
+---
+
 ## Not yet logged (topics to add as they come up)
 
-- Sharding / consistent hashing (Phase 2)
-- Two-Phase Commit / cross-shard transactions (Phase 2)
 - Hybrid Logical Clocks (Phase 3)
-- Event sourcing (Phase 3)
+- Snapshotting / log compaction (LATER.md; Ongaro's dissertation covers it)
+- Cluster membership changes (LATER.md; Raft §6, joint consensus)
+- Follower reads (LATER.md)
+- Backpressure / load shedding / rate limiting (LATER.md)
