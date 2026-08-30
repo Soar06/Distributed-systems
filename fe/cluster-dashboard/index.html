@@ -4,342 +4,334 @@
 <meta charset="utf-8">
 <title>Core Bank — Cluster Dashboard</title>
 <style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --line: #262b36; --card: #1d212b;
+    --text: #e5e7eb; --dim: #9ca3af; --faint: #6b7280;
+    --green: #4ade80; --blue: #60a5fa; --amber: #facc15; --red: #f87171;
+  }
+  * { box-sizing: border-box; }
   body {
-    font-family: system-ui, sans-serif;
-    background: #0f1115;
-    color: #e5e7eb;
-    margin: 0;
-    padding: 20px;
+    font-family: system-ui, -apple-system, sans-serif;
+    background: var(--bg); color: var(--text); margin: 0; padding: 18px;
   }
-  h1 { font-size: 18px; margin: 0 0 4px; }
-  .sub { font-size: 12px; color: #9ca3af; margin-bottom: 20px; }
-  .grid {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 20px;
-  }
+  h1 { font-size: 18px; margin: 0 0 2px; }
+  .sub { font-size: 12px; color: var(--dim); margin-bottom: 16px; }
+  .sub code { background: #1f2430; padding: 1px 5px; border-radius: 3px; }
+
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
   .panel {
-    background: #171a21;
-    border: 1px solid #262b36;
-    border-radius: 10px;
-    padding: 14px;
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 10px; padding: 14px;
   }
   .panel h2 {
-    font-size: 13px;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    color: #9ca3af;
-    margin: 0 0 12px;
+    font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em;
+    color: var(--dim); margin: 0 0 12px; display: flex;
+    justify-content: space-between; align-items: center;
   }
+  .wide { grid-column: 1 / span 2; }
 
-  /* node cards */
-  .nodes { display: flex; gap: 10px; flex-wrap: wrap; }
+  /* connection + health banner */
+  .banner {
+    display: flex; gap: 14px; align-items: center; font-size: 12px;
+    margin-bottom: 14px; padding: 8px 12px; border-radius: 8px;
+    background: var(--panel); border: 1px solid var(--line);
+  }
+  .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+  .dot.up { background: var(--green); }
+  .dot.down { background: var(--red); }
+  .banner .money { margin-left: auto; color: var(--dim); }
+  .banner .money b { color: var(--text); }
+
+  /* shards */
+  .shard {
+    border: 1px solid var(--line); border-radius: 8px;
+    padding: 10px; margin-bottom: 10px; background: #14171e;
+  }
+  .shard-head {
+    display: flex; align-items: center; gap: 8px;
+    font-size: 13px; font-weight: 600; margin-bottom: 8px;
+  }
+  .shard-head .meta { margin-left: auto; font-size: 11px; color: var(--faint); font-weight: 400; }
+  .badge {
+    font-size: 10px; padding: 2px 6px; border-radius: 4px; font-weight: 600;
+  }
+  .badge.ready { background: #16a34a26; color: var(--green); }
+  .badge.notready { background: #dc262626; color: var(--red); }
+  .badge.indoubt { background: #ca8a0426; color: var(--amber); }
+
+  .nodes { display: flex; gap: 8px; flex-wrap: wrap; }
   .node {
-    flex: 1;
-    min-width: 130px;
-    border-radius: 8px;
-    padding: 10px;
-    border: 1px solid #2a2f3a;
-    background: #1d212b;
+    flex: 1; min-width: 150px; border-radius: 7px; padding: 9px;
+    border: 1px solid #2a2f3a; background: var(--card);
+    transition: border-color .15s, opacity .15s;
   }
-  .node .name { font-size: 13px; font-weight: 600; margin-bottom: 6px; }
+  .node.down { opacity: .45; border-color: #7f1d1d; }
+  .node.lagging { border-color: #a16207; }
+  .node .name { font-size: 12px; font-weight: 600; margin-bottom: 5px; }
   .role {
-    display: inline-block;
-    font-size: 10px;
-    padding: 2px 6px;
-    border-radius: 4px;
-    margin-bottom: 8px;
-    font-weight: 600;
+    display: inline-block; font-size: 10px; padding: 2px 6px;
+    border-radius: 4px; margin-bottom: 6px; font-weight: 600;
   }
-  .role.leader { background: #16a34a33; color: #4ade80; }
-  .role.follower { background: #2563eb33; color: #60a5fa; }
-  .role.candidate { background: #ca8a0433; color: #facc15; }
-  .req-status {
-    font-size: 11px;
-    padding: 4px 6px;
-    border-radius: 4px;
-    margin-top: 6px;
+  .role.Leader { background: #16a34a33; color: var(--green); }
+  .role.Follower { background: #2563eb33; color: var(--blue); }
+  .role.Candidate { background: #ca8a0433; color: var(--amber); }
+  .role.Down { background: #dc262633; color: var(--red); }
+  .node .stats { font-size: 10px; color: var(--faint); line-height: 1.5; font-variant-numeric: tabular-nums; }
+  .node .lag { color: var(--amber); }
+  .node button {
+    width: 100%; margin-top: 7px; font-size: 10px; padding: 4px;
+    border-radius: 4px; border: 1px solid #3a4150; background: #232834;
+    color: var(--text); cursor: pointer;
   }
-  .req-status.pending { background: #ca8a0422; color: #facc15; }
-  .req-status.committed { background: #16a34a22; color: #4ade80; }
-  .req-status.waiting { background: #37415133; color: #9ca3af; }
-  .datarow { font-size: 11px; color: #9ca3af; margin-top: 4px; }
+  .node button:hover { background: #2c323f; }
+  .node button.revive { border-color: #15803d; color: var(--green); }
 
-  /* hash ring */
+  /* ring */
   .ring-wrap { display: flex; justify-content: center; }
-  svg text { fill: #e5e7eb; font-size: 10px; }
+  .ring-label { font-size: 9px; fill: var(--dim); }
 
-  /* collision panel */
-  .collision-log {
-    font-size: 12px;
-    font-family: ui-monospace, monospace;
-    background: #0f1115;
-    border: 1px solid #262b36;
-    border-radius: 6px;
-    padding: 10px;
-    height: 160px;
-    overflow-y: auto;
+  /* tables + log */
+  table { width: 100%; border-collapse: collapse; font-size: 11px; }
+  th {
+    text-align: left; color: var(--faint); font-weight: 500;
+    padding: 4px 6px; border-bottom: 1px solid var(--line);
   }
-  .collision-log div { margin-bottom: 4px; }
-  .collision-log .a { color: #60a5fa; }
-  .collision-log .b { color: #f472b6; }
-  .collision-log .sys { color: #9ca3af; }
+  td { padding: 4px 6px; border-bottom: 1px solid #1e222b; font-variant-numeric: tabular-nums; }
+  td.num { text-align: right; }
+  .reserved { color: var(--amber); font-size: 10px; }
 
-  button.sim {
-    margin-top: 10px;
-    background: #374151;
-    color: #e5e7eb;
-    border: 1px solid #4b5563;
-    border-radius: 6px;
-    padding: 6px 12px;
-    font-size: 12px;
-    cursor: pointer;
+  .log {
+    font-family: ui-monospace, Menlo, Consolas, monospace;
+    font-size: 11px; line-height: 1.6; max-height: 260px; overflow-y: auto;
+    background: #101319; border: 1px solid var(--line); border-radius: 6px; padding: 8px;
   }
+  .log div { white-space: pre-wrap; color: var(--dim); }
+  .log div.hot { color: var(--text); }
+  .log div.bad { color: var(--red); }
+  .log div.warn { color: var(--amber); }
 
-  .node { cursor: pointer; transition: border-color 0.15s, background 0.15s; }
-  .node:hover { border-color: #4b5563; }
-  .node.selected { border-color: #60a5fa; background: #1e2530; }
-
-  svg .ring-node { cursor: pointer; }
-  svg .ring-node circle { transition: stroke 0.15s, stroke-width 0.15s; }
-  svg .ring-node.selected circle { stroke: #60a5fa; stroke-width: 3px; }
-
-  /* node detail panel */
-  #nodeDetail { display: none; }
-  #nodeDetail.open { display: block; }
-  .detail-empty { font-size: 12px; color: #6b7280; font-style: italic; }
-  .detail-head {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    margin-bottom: 10px;
-  }
-  .detail-head .title { font-size: 14px; font-weight: 600; }
-  .kv-table { width: 100%; border-collapse: collapse; font-size: 12px; }
-  .kv-table th {
-    text-align: left;
-    color: #9ca3af;
-    font-weight: 500;
-    padding: 4px 6px;
-    border-bottom: 1px solid #262b36;
-  }
-  .kv-table td {
-    padding: 4px 6px;
-    border-bottom: 1px solid #1c2028;
-    font-family: ui-monospace, monospace;
-  }
-  .range-pill {
-    display: inline-block;
-    font-size: 11px;
-    background: #1d212b;
-    border: 1px solid #2a2f3a;
-    border-radius: 4px;
-    padding: 3px 8px;
-    color: #9ca3af;
-    margin-bottom: 10px;
-  }
+  .hint { font-size: 11px; color: var(--faint); margin-top: 8px; line-height: 1.5; }
 </style>
 </head>
 <body>
 
-<h1>Core Bank — Cluster Dashboard</h1>
-<div class="sub">Mock data only — not yet wired to backend. Layout preview for Phase 4. Click a node (card or ring dot) to inspect its stored data.</div>
+<h1>Cluster Dashboard</h1>
+<div class="sub">
+  Live state from a real cluster over <code>/api/stream</code> (Server-Sent Events).
+  Kill a node and watch the failover — nothing here is mocked.
+</div>
+
+<div class="banner">
+  <span><span class="dot down" id="connDot"></span> <span id="connText">connecting…</span></span>
+  <span id="clockText" style="color:var(--faint)"></span>
+  <span class="money">total money <b id="totalMoney">—</b></span>
+</div>
 
 <div class="grid">
 
+  <div class="panel wide">
+    <h2>Shards &amp; Nodes <span id="shardCount" style="color:var(--faint);font-weight:400"></span></h2>
+    <div id="shards"></div>
+    <div class="hint">
+      Killing a node crashes its network link. With 3 replicas a shard survives one
+      loss; kill two and the shard stops committing — that is quorum, not a bug.
+    </div>
+  </div>
+
   <div class="panel">
-    <h2>Nodes</h2>
-    <div class="nodes" id="nodes"></div>
+    <h2>Hash Ring</h2>
+    <div class="ring-wrap"><svg id="ring" width="300" height="300" viewBox="0 0 300 300"></svg></div>
+    <div class="hint">
+      Real placement: each dot sits at <code>crc32(account)</code> on the 2^32 ring
+      and is owned by the first shard clockwise.
+    </div>
   </div>
 
   <div class="panel">
-    <h2>Hash Ring (single Raft group — Phase 1)</h2>
-    <div class="ring-wrap">
-      <svg width="220" height="220" viewBox="0 0 220 220"></svg>
+    <h2>Recent Transactions</h2>
+    <div id="txs" class="log" style="max-height:300px"></div>
+    <div class="hint">
+      The HLC timestamp is what orders these ACROSS shards — per-shard
+      <code>Seq</code> numbers are unrelated between shards.
     </div>
   </div>
 
-  <div class="panel" style="grid-column: 1 / span 2;">
-    <h2>Node Detail</h2>
-    <div id="nodeDetailEmpty" class="detail-empty">No node selected — click a node card or ring dot above.</div>
-    <div id="nodeDetail">
-      <div class="detail-head">
-        <span class="title" id="detailTitle">node-1</span>
-        <span class="role" id="detailRole">LEADER</span>
-      </div>
-      <div class="range-pill" id="detailRange">hash range: 0x0000 – 0x5555</div>
-      <table class="kv-table">
-        <thead><tr><th>Account</th><th>Balance</th><th>Last log idx</th></tr></thead>
-        <tbody id="detailRows"></tbody>
-      </table>
-    </div>
-  </div>
-
-  <div class="panel" style="grid-column: 1 / span 2;">
-    <h2>Same-Account Collision Monitor</h2>
-    <div class="collision-log" id="collisionLog">
-      <div class="sys">Waiting for concurrent requests on the same account...</div>
-    </div>
-    <button class="sim" onclick="simulateCollision()">Simulate collision (mock)</button>
+  <div class="panel wide">
+    <h2>Cluster Events</h2>
+    <div id="events" class="log"></div>
   </div>
 
 </div>
 
 <script>
-  // mock hash range + stored accounts per node (Phase 1: all 3 nodes replicate the
-  // same single Raft group, so ranges cover the whole ring and data is identical —
-  // this becomes real per-node partitioning once Phase 2 sharding lands)
-  const nodesData = [
-    {
-      name: 'node-1', role: 'leader',
-      data: 'log: 42 entries, balance acc-1=$1000',
-      hashRange: '0x0000 – 0x5555',
-      accounts: [
-        { id: 'acc-1', balance: 1000, lastIdx: 42 },
-        { id: 'acc-2', balance: 500,  lastIdx: 40 },
-        { id: 'acc-3', balance: 2500, lastIdx: 41 },
-      ],
-    },
-    {
-      name: 'node-2', role: 'follower',
-      data: 'log: 42 entries, in sync',
-      hashRange: '0x5556 – 0xAAAA',
-      accounts: [
-        { id: 'acc-1', balance: 1000, lastIdx: 42 },
-        { id: 'acc-2', balance: 500,  lastIdx: 40 },
-        { id: 'acc-3', balance: 2500, lastIdx: 41 },
-      ],
-    },
-    {
-      name: 'node-3', role: 'follower',
-      data: 'log: 41 entries, replicating...',
-      hashRange: '0xAAAB – 0xFFFF',
-      accounts: [
-        { id: 'acc-1', balance: 1000, lastIdx: 41 },
-        { id: 'acc-2', balance: 500,  lastIdx: 40 },
-        { id: 'acc-3', balance: 2500, lastIdx: 41 },
-      ],
-    },
-  ];
+'use strict';
 
-  let selectedNode = null;
+const $ = (id) => document.getElementById(id);
+const money = (cents) => (cents / 100).toFixed(2);
 
-  function renderNodes() {
-    const container = document.getElementById('nodes');
-    container.innerHTML = '';
-    nodesData.forEach(n => {
-      const div = document.createElement('div');
-      div.className = 'node' + (selectedNode === n.name ? ' selected' : '');
-      div.innerHTML = `
-        <div class="name">${n.name}</div>
+let selectedShard = null;
+
+// ---- live stream -----------------------------------------------------------
+//
+// EventSource reconnects on its own, which is most of why SSE is enough here:
+// there is no reconnect logic to write. Each frame is a COMPLETE snapshot, so a
+// missed frame is harmless — the next one is fully current.
+const source = new EventSource('/api/stream');
+
+source.onopen = () => {
+  $('connDot').className = 'dot up';
+  $('connText').textContent = 'streaming';
+};
+source.onerror = () => {
+  $('connDot').className = 'dot down';
+  $('connText').textContent = 'reconnecting…';
+};
+source.onmessage = (e) => {
+  try { render(JSON.parse(e.data)); } catch (err) { /* skip a malformed frame */ }
+};
+
+// ---- control ---------------------------------------------------------------
+
+async function post(path) {
+  try {
+    const r = await fetch(path, { method: 'POST' });
+    return await r.json();
+  } catch (err) {
+    return { ok: false, err: String(err) };
+  }
+}
+
+async function killNode(id)   { await post('/api/kill?node=' + encodeURIComponent(id)); }
+async function reviveNode(id) { await post('/api/revive?node=' + encodeURIComponent(id)); }
+
+window.killNode = killNode;
+window.reviveNode = reviveNode;
+
+// ---- render ----------------------------------------------------------------
+
+function render(view) {
+  $('clockText').textContent = view.time;
+  $('totalMoney').textContent = money(view.total_money);
+  $('shardCount').textContent = view.shards.length + ' shards';
+
+  renderShards(view.shards);
+  renderRing(view.ring, view.shards);
+  renderTxs(view.shards);
+  renderEvents(view.events);
+}
+
+function renderShards(shards) {
+  $('shards').innerHTML = shards.map(s => {
+    const badge = s.ready
+      ? '<span class="badge ready">READY</span>'
+      : '<span class="badge notready">NOT READY</span>';
+    const doubt = s.in_doubt > 0
+      ? `<span class="badge indoubt">${s.in_doubt} IN DOUBT</span>` : '';
+
+    const nodes = s.nodes.map(n => {
+      const cls = ['node'];
+      if (n.crashed) cls.push('down');
+      else if (n.lagging) cls.push('lagging');
+
+      const btn = n.crashed
+        ? `<button class="revive" onclick="reviveNode('${n.id}')">revive</button>`
+        : `<button onclick="killNode('${n.id}')">kill</button>`;
+
+      const lag = n.lagging ? ' <span class="lag">lagging</span>' : '';
+
+      return `<div class="${cls.join(' ')}">
+        <div class="name">${n.id}</div>
         <span class="role ${n.role}">${n.role.toUpperCase()}</span>
-        <div class="datarow">${n.data}</div>
-        <div class="req-status waiting" id="req-${n.name}">idle</div>
-      `;
-      div.addEventListener('click', () => selectNode(n.name));
-      container.appendChild(div);
-    });
-  }
-  renderNodes();
+        <div class="stats">
+          term ${n.term} &middot; log ${n.log_len}<br>
+          commit ${n.commit} &middot; applied ${n.applied}${lag}
+        </div>
+        ${btn}
+      </div>`;
+    }).join('');
 
-  // simple hash ring drawing (3 nodes, evenly spaced, mock)
-  function drawRing() {
-    const svg = document.querySelector('svg');
-    const cx = 110, cy = 110, r = 80;
-    svg.innerHTML = `<circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="#2a2f3a" stroke-width="2"/>`;
-    nodesData.forEach((n, i) => {
-      const angle = (i / nodesData.length) * 2 * Math.PI - Math.PI / 2;
-      const x = cx + r * Math.cos(angle);
-      const y = cy + r * Math.sin(angle);
-      const g = document.createElementNS('http://www.w3.org/2000/svg', 'g');
-      g.setAttribute('class', 'ring-node' + (selectedNode === n.name ? ' selected' : ''));
-      g.innerHTML = `
-        <circle cx="${x}" cy="${y}" r="10" fill="${n.role === 'leader' ? '#16a34a' : '#2563eb'}" stroke="transparent"/>
-        <text x="${x}" y="${y - 16}" text-anchor="middle">${n.name}</text>
-      `;
-      g.addEventListener('click', () => selectNode(n.name));
-      svg.appendChild(g);
-    });
-    const centerLabel = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-    centerLabel.setAttribute('x', cx);
-    centerLabel.setAttribute('y', cy);
-    centerLabel.setAttribute('text-anchor', 'middle');
-    centerLabel.setAttribute('fill', '#9ca3af');
-    centerLabel.textContent = 'acc-1..N';
-    svg.appendChild(centerLabel);
-  }
-  drawRing();
+    const accounts = Object.keys(s.accounts).sort().map(a => {
+      const held = (s.reserved && s.reserved[a]) || 0;
+      const heldTxt = held ? `<span class="reserved">${money(held)} held</span>` : '';
+      return `<tr><td>${a}</td><td class="num">${money(s.accounts[a])}</td><td>${heldTxt}</td></tr>`;
+    }).join('');
 
-  function selectNode(name) {
-    selectedNode = name;
-    renderNodes();
-    drawRing();
-    renderDetail();
-  }
+    const table = accounts
+      ? `<table><thead><tr><th>Account</th><th class="num">Balance</th><th></th></tr></thead>
+         <tbody>${accounts}</tbody></table>`
+      : '<div class="hint">no accounts on this shard</div>';
 
-  function renderDetail() {
-    const emptyEl = document.getElementById('nodeDetailEmpty');
-    const detailEl = document.getElementById('nodeDetail');
-    if (!selectedNode) {
-      emptyEl.style.display = 'block';
-      detailEl.classList.remove('open');
-      return;
-    }
-    const n = nodesData.find(x => x.name === selectedNode);
-    emptyEl.style.display = 'none';
-    detailEl.classList.add('open');
+    const reason = (!s.ready && s.reason)
+      ? `<div class="hint" style="color:var(--red)">${s.reason}</div>` : '';
 
-    document.getElementById('detailTitle').textContent = n.name;
-    const roleEl = document.getElementById('detailRole');
-    roleEl.textContent = n.role.toUpperCase();
-    roleEl.className = 'role ' + n.role;
-    document.getElementById('detailRange').textContent = 'hash range: ' + n.hashRange;
+    return `<div class="shard">
+      <div class="shard-head">
+        <span>${s.id}</span> ${badge} ${doubt}
+        <span class="meta">leader ${s.leader || '—'} &middot; term ${s.term}</span>
+      </div>
+      <div class="nodes">${nodes}</div>
+      ${reason}
+      <div style="margin-top:8px">${table}</div>
+    </div>`;
+  }).join('');
+}
 
-    const rows = document.getElementById('detailRows');
-    rows.innerHTML = n.accounts.map(a => `
-      <tr>
-        <td>${a.id}</td>
-        <td>$${a.balance.toLocaleString(undefined, {minimumFractionDigits: 2})}</td>
-        <td>${a.lastIdx}</td>
-      </tr>
-    `).join('');
-  }
-  renderDetail();
+// Colours are assigned by shard INDEX, so a shard keeps its colour between
+// frames — a ring whose colours shuffle on every update is unreadable.
+const SHARD_COLOURS = ['#60a5fa', '#4ade80', '#facc15', '#f472b6', '#a78bfa', '#fb923c'];
 
-  function logCollision(msg, cls) {
-    const line = document.createElement('div');
-    line.className = cls || '';
-    line.textContent = msg;
-    document.getElementById('collisionLog').prepend(line);
-  }
+function renderRing(points, shards) {
+  const svg = $('ring');
+  const cx = 150, cy = 150, r = 105;
+  const colourOf = {};
+  shards.forEach((s, i) => { colourOf[s.id] = SHARD_COLOURS[i % SHARD_COLOURS.length]; });
 
-  function setReqStatus(nodeName, status, text) {
-    const el = document.getElementById('req-' + nodeName);
-    el.className = 'req-status ' + status;
-    el.textContent = text;
-  }
+  let out = `<circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="#2a2f3a" stroke-width="1.5"/>`;
 
-  function simulateCollision() {
-    logCollision('--- Window A and Window B both sent withdraw($80) on acc-1 ---', 'sys');
-    logCollision('Window A: withdraw $80 -> leader (node-1)', 'a');
-    logCollision('Window B: withdraw $80 -> leader (node-1)', 'b');
+  // Shard arcs: where each shard's virtual nodes sit is not exposed, so the ring
+  // shows the KEYS, which is the part that actually moves when placement changes.
+  points.forEach(p => {
+    const rad = (p.angle - 90) * Math.PI / 180;
+    const x = cx + r * Math.cos(rad), y = cy + r * Math.sin(rad);
+    const lx = cx + (r + 20) * Math.cos(rad), ly = cy + (r + 20) * Math.sin(rad);
+    const c = colourOf[p.shard] || '#9ca3af';
+    out += `<line x1="${cx}" y1="${cy}" x2="${x}" y2="${y}" stroke="${c}" stroke-width="0.5" opacity="0.25"/>`;
+    out += `<circle cx="${x}" cy="${y}" r="5" fill="${c}"/>`;
+    out += `<text x="${lx}" y="${ly}" class="ring-label" text-anchor="middle" dominant-baseline="middle">${p.account}</text>`;
+  });
 
-    nodesData.forEach(n => setReqStatus(n.name, 'pending', 'pending...'));
+  // Legend in the middle.
+  shards.forEach((s, i) => {
+    const y = cy - (shards.length - 1) * 7 + i * 14;
+    out += `<circle cx="${cx - 34}" cy="${y}" r="4" fill="${colourOf[s.id]}"/>`;
+    out += `<text x="${cx - 25}" y="${y}" class="ring-label" dominant-baseline="middle">${s.id}</text>`;
+  });
 
-    setTimeout(() => {
-      logCollision('Leader orders A before B in the log (index 43)', 'sys');
-      setReqStatus('node-1', 'committed', 'A committed (idx 43)');
-      setReqStatus('node-2', 'pending', 'replicating idx 43...');
-      setReqStatus('node-3', 'pending', 'replicating idx 43...');
-    }, 500);
+  svg.innerHTML = out;
+}
 
-    setTimeout(() => {
-      logCollision('A committed cluster-wide. Balance now $920.', 'a');
-      logCollision('B evaluated against updated balance ($920) -> insufficient? depends on backend rule (TBD)', 'sys');
-      nodesData.forEach(n => setReqStatus(n.name, 'committed', 'in sync (idx 44)'));
-    }, 1400);
-  }
+function renderTxs(shards) {
+  // Merged across shards and sorted by HLC timestamp — which is exactly what the
+  // per-shard Seq counter cannot do, and the reason HLC exists.
+  const all = [];
+  shards.forEach(s => (s.recent || []).forEach(t => all.push({ shard: s.id, ...t })));
+  all.sort((a, b) => (b.wall - a.wall) || (b.logical - a.logical));
+
+  $('txs').innerHTML = all.slice(0, 14).map(t =>
+    `<div><span style="color:var(--faint)">${t.ts}</span>  ` +
+    `<span style="color:var(--blue)">${t.shard}</span>  ${t.op}  ${t.summary}</div>`
+  ).join('') || '<div>no transactions yet</div>';
+}
+
+function renderEvents(events) {
+  $('events').innerHTML = (events || []).map(e => {
+    let cls = '';
+    if (/KILLED|FAILED|violation/i.test(e)) cls = 'bad';
+    else if (/INDETERMINATE|in doubt|refused/i.test(e)) cls = 'warn';
+    else if (/REVIVED|ok|resolved/i.test(e)) cls = 'hot';
+    return `<div class="${cls}">${e}</div>`;
+  }).join('');
+}
 </script>
-
 </body>
 </html>

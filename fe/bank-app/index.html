@@ -2,285 +2,318 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Core Bank — App</title>
+<title>Core Bank — Bank App</title>
 <style>
-  html, body {
-    height: 100%;
-    margin: 0;
+  :root {
+    --bg: #0f1115; --panel: #171a21; --line: #262b36; --card: #1d212b;
+    --text: #e5e7eb; --dim: #9ca3af; --faint: #6b7280;
+    --green: #4ade80; --blue: #60a5fa; --amber: #facc15; --red: #f87171;
   }
+  * { box-sizing: border-box; }
   body {
-    font-family: system-ui, sans-serif;
-    background: #e5e7eb;
-    background-image: radial-gradient(#d1d5db 1px, transparent 1px);
-    background-size: 18px 18px;
-    overflow: hidden;
+    font-family: system-ui, -apple-system, sans-serif;
+    background: var(--bg); color: var(--text); margin: 0; padding: 16px;
   }
-  .toolbar {
-    position: fixed;
-    top: 0; left: 0; right: 0;
-    height: 46px;
-    background: #1f2937;
-    color: white;
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    padding: 0 14px;
-    z-index: 1000;
-    font-size: 13px;
+  h1 { font-size: 17px; margin: 0 0 2px; }
+  .sub { font-size: 12px; color: var(--dim); margin-bottom: 14px; }
+  code { background: #1f2430; padding: 1px 5px; border-radius: 3px; font-size: 11px; }
+
+  .panel {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 10px; padding: 14px; margin-bottom: 14px;
   }
-  .toolbar button {
-    background: #16a34a;
-    color: white;
-    border: none;
-    border-radius: 6px;
-    padding: 6px 12px;
-    font-size: 13px;
-    cursor: pointer;
-  }
-  .toolbar select {
-    padding: 5px 8px;
-    border-radius: 6px;
-    border: none;
-    font-size: 13px;
-  }
-  .desk {
-    position: absolute;
-    top: 46px; left: 0; right: 0; bottom: 0;
+  .panel h2 {
+    font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em;
+    color: var(--dim); margin: 0 0 12px;
   }
 
-  .window {
-    position: absolute;
-    width: 300px;
-    background: white;
-    border-radius: 10px;
-    box-shadow: 0 4px 14px rgba(0,0,0,0.25);
-    overflow: hidden;
-    user-select: none;
+  label { display: block; font-size: 11px; color: var(--dim); margin-bottom: 4px; }
+  input, select {
+    background: #12151c; border: 1px solid #2f3542; color: var(--text);
+    border-radius: 6px; padding: 7px 9px; font-size: 13px; width: 100%;
   }
-  .window.focused { box-shadow: 0 6px 20px rgba(0,0,0,0.4); }
+  input:focus, select:focus { outline: none; border-color: #4b5563; }
 
-  .titlebar {
-    background: #1f2937;
-    color: white;
-    padding: 8px 10px;
-    font-size: 12px;
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    cursor: move;
-  }
-  .titlebar .close {
-    cursor: pointer;
-    opacity: 0.7;
-    padding: 0 4px;
-  }
-  .titlebar .close:hover { opacity: 1; color: #f87171; }
+  .row { display: flex; gap: 10px; margin-bottom: 10px; }
+  .row > div { flex: 1; }
 
-  .body { padding: 14px; user-select: text; }
-  label { font-size: 11px; color: #555; display: block; margin-bottom: 4px; }
-  select, input {
-    width: 100%;
-    box-sizing: border-box;
-    padding: 6px 8px;
-    margin-bottom: 10px;
-    border: 1px solid #ccc;
-    border-radius: 6px;
-    font-size: 13px;
+  button {
+    border: 1px solid #3a4150; background: #232834; color: var(--text);
+    border-radius: 6px; padding: 8px 12px; font-size: 12px; cursor: pointer;
   }
+  button:hover { background: #2c323f; }
+  button.primary { border-color: #1d4ed8; background: #1e3a8a55; color: var(--blue); }
+  button.danger { border-color: #b91c1c; background: #7f1d1d33; color: var(--red); }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+
   .balance {
-    text-align: center;
-    padding: 12px 0;
-    margin-bottom: 10px;
-    background: #f0fdf4;
-    border-radius: 8px;
+    font-size: 30px; font-weight: 600; font-variant-numeric: tabular-nums;
+    margin: 2px 0 2px;
   }
-  .balance .amount { font-size: 22px; font-weight: 700; color: #166534; }
-  .balance .label { font-size: 10px; color: #555; text-transform: uppercase; }
-  .actions { display: flex; gap: 8px; margin-bottom: 10px; }
-  .actions button {
-    flex: 1;
-    padding: 7px 0;
-    border: none;
-    border-radius: 6px;
-    font-size: 13px;
-    cursor: pointer;
+  .balance.stale { color: var(--faint); }
+  .balance-meta { font-size: 11px; color: var(--faint); }
+  .held { color: var(--amber); font-size: 12px; }
+
+  .log {
+    font-family: ui-monospace, Menlo, Consolas, monospace;
+    font-size: 11px; line-height: 1.6; max-height: 240px; overflow-y: auto;
+    background: #101319; border: 1px solid var(--line); border-radius: 6px; padding: 8px;
   }
-  .deposit { background: #16a34a; color: white; }
-  .withdraw { background: #dc2626; color: white; }
-  .logbox {
-    font-size: 10.5px;
-    color: #444;
-    background: #f9fafb;
-    border: 1px solid #eee;
-    border-radius: 6px;
-    padding: 6px;
-    height: 70px;
-    overflow-y: auto;
+  .log div { white-space: pre-wrap; }
+  .log .ok { color: var(--green); }
+  .log .bad { color: var(--red); }
+  .log .warn { color: var(--amber); }
+  .log .dim { color: var(--faint); }
+
+  .outcome {
+    display: inline-block; font-size: 10px; padding: 2px 6px;
+    border-radius: 4px; font-weight: 600; margin-right: 6px;
   }
-  .logbox div { margin-bottom: 3px; }
-  .status { font-size: 10.5px; margin-top: 6px; min-height: 14px; color: #a16207; }
+  .outcome.ok { background: #16a34a26; color: var(--green); }
+  .outcome.failed { background: #dc262626; color: var(--red); }
+  .outcome.indeterminate { background: #ca8a0426; color: var(--amber); }
+
+  .hint { font-size: 11px; color: var(--faint); line-height: 1.55; margin-top: 8px; }
+  .warnbox {
+    font-size: 11px; color: var(--amber); background: #78350f22;
+    border: 1px solid #78350f; border-radius: 6px; padding: 8px; margin-top: 10px;
+    line-height: 1.5;
+  }
 </style>
 </head>
 <body>
 
-<div class="toolbar">
-  <strong>Core Bank — Bank App</strong>
-  <span style="opacity:0.6;">|</span>
-  <label style="margin:0; color:#cbd5e1;">New window for:</label>
-  <select id="newAccount">
-    <option value="acc-1">Account A (acc-1)</option>
-    <option value="acc-2">Account B (acc-2)</option>
-    <option value="acc-3">Account C (acc-3)</option>
-  </select>
-  <button onclick="spawnWindow()">+ Add Window</button>
-  <span style="opacity:0.6; margin-left:auto;">Drag titlebars to move · shared fake balances across windows</span>
+<h1>Bank App <span id="windowTag" style="font-size:12px;color:var(--faint)"></span></h1>
+<div class="sub">
+  One window = one client session. Open several against the <b>same account</b> and
+  fire at once to see what the backend really does.
 </div>
 
-<div class="desk" id="desk"></div>
+<div class="panel">
+  <h2>Account</h2>
+  <div class="row">
+    <div>
+      <label for="account">Account</label>
+      <select id="account"></select>
+    </div>
+    <div style="flex:0 0 auto;align-self:flex-end">
+      <button onclick="openWindow()">New window</button>
+    </div>
+  </div>
+
+  <div class="balance" id="balance">—</div>
+  <div class="balance-meta">
+    on <span id="shardName">—</span> &middot; <span id="heldText"></span>
+    <span id="staleNote"></span>
+  </div>
+</div>
+
+<div class="panel">
+  <h2>Move Money</h2>
+  <div class="row">
+    <div>
+      <label for="op">Operation</label>
+      <select id="op" onchange="onOpChange()">
+        <option value="deposit">Deposit</option>
+        <option value="withdraw">Withdraw</option>
+        <option value="transfer">Transfer</option>
+      </select>
+    </div>
+    <div>
+      <label for="amount">Amount (cents)</label>
+      <input id="amount" type="number" value="1000" min="1">
+    </div>
+    <div id="toWrap" style="display:none">
+      <label for="to">To account</label>
+      <select id="to"></select>
+    </div>
+  </div>
+
+  <div class="row">
+    <div>
+      <label for="key">Idempotency key</label>
+      <input id="key" placeholder="auto-generated per request">
+    </div>
+    <div style="flex:0 0 auto;align-self:flex-end;display:flex;gap:8px">
+      <button class="primary" onclick="submit(false)">Send</button>
+      <button onclick="submit(true)">Send twice (retry)</button>
+    </div>
+  </div>
+
+  <div class="hint">
+    <b>Send twice</b> fires the same idempotency key twice. The money must move
+    <b>once</b> — that is what makes a timed-out request safe to reissue.
+  </div>
+
+  <div class="warnbox">
+    Two windows on one account, both withdrawing: the ledger serializes them
+    through the Raft log, so exactly the available funds can be withdrawn and the
+    balance never goes negative. The loser gets <code>insufficient funds</code>,
+    not a corrupted balance.
+  </div>
+</div>
+
+<div class="panel">
+  <h2>This Window's Requests</h2>
+  <div id="log" class="log"><div class="dim">no requests yet</div></div>
+</div>
 
 <script>
-  // Static mockup only — no backend wired yet.
-  // Balances are shared across all spawned windows (module-level state),
-  // so two windows on the same account really do affect each other.
-  const fakeBalances = { 'acc-1': 1000, 'acc-2': 500, 'acc-3': 2500 };
-  const accountLabels = { 'acc-1': 'Account A', 'acc-2': 'Account B', 'acc-3': 'Account C' };
+'use strict';
 
-  let windowCount = 0;
-  let zTop = 1;
-  const openWindows = []; // { id, account, el, refs:{balance, log, status} }
+const $ = (id) => document.getElementById(id);
+const money = (c) => (c / 100).toFixed(2);
 
-  function spawnWindow(account) {
-    account = account || document.getElementById('newAccount').value;
-    windowCount++;
-    const id = windowCount;
+// Each window is an independent client session, which is the whole point of the
+// multi-window requirement: separate sessions issuing concurrent requests is what
+// makes "multiple clients at once" a real thing rather than a description.
+const WINDOW_ID = Math.random().toString(36).slice(2, 7);
+$('windowTag').textContent = '· window ' + WINDOW_ID;
 
-    const winEl = document.createElement('div');
-    winEl.className = 'window';
-    winEl.style.left = (30 + (windowCount % 6) * 40) + 'px';
-    winEl.style.top = (20 + (windowCount % 6) * 30) + 'px';
-    winEl.style.zIndex = ++zTop;
+let accounts = [];
+let lastView = null;
 
-    winEl.innerHTML = `
-      <div class="titlebar" data-role="drag-handle">
-        <span>Bank App — #${id}</span>
-        <span class="close" data-role="close">✕</span>
-      </div>
-      <div class="body">
-        <label>Account</label>
-        <select data-role="account">
-          <option value="acc-1">Account A (acc-1)</option>
-          <option value="acc-2">Account B (acc-2)</option>
-          <option value="acc-3">Account C (acc-3)</option>
-        </select>
+// ---- live balance ----------------------------------------------------------
+//
+// The balance is read from the same SSE stream the dashboard uses, so the two
+// UIs are watching one cluster and agree by construction. A window shows its
+// account's balance updating as OTHER windows move money.
+const source = new EventSource('/api/stream');
+source.onmessage = (e) => {
+  try { onView(JSON.parse(e.data)); } catch (err) { /* skip a bad frame */ }
+};
 
-        <div class="balance">
-          <div class="amount" data-role="balance">$0.00</div>
-          <div class="label">Current Balance</div>
-        </div>
+function onView(view) {
+  lastView = view;
 
-        <label>Amount</label>
-        <input type="number" data-role="amount" placeholder="0.00" value="50">
+  const names = [];
+  view.shards.forEach(s => Object.keys(s.accounts).forEach(a => names.push(a)));
+  names.sort();
 
-        <div class="actions">
-          <button class="deposit" data-role="deposit">Deposit</button>
-          <button class="withdraw" data-role="withdraw">Withdraw</button>
-        </div>
-
-        <div class="status" data-role="status"></div>
-
-        <label style="margin-top:8px;">Activity (this window)</label>
-        <div class="logbox" data-role="log"><div>Window #${id} opened (mock)</div></div>
-      </div>
-    `;
-
-    document.getElementById('desk').appendChild(winEl);
-
-    const refs = {
-      accountSel: winEl.querySelector('[data-role="account"]'),
-      balance: winEl.querySelector('[data-role="balance"]'),
-      amount: winEl.querySelector('[data-role="amount"]'),
-      status: winEl.querySelector('[data-role="status"]'),
-      log: winEl.querySelector('[data-role="log"]'),
-    };
-    refs.accountSel.value = account;
-
-    const win = { id, el: winEl, refs };
-    openWindows.push(win);
-
-    winEl.querySelector('[data-role="close"]').addEventListener('click', () => {
-      winEl.remove();
-      const idx = openWindows.indexOf(win);
-      if (idx >= 0) openWindows.splice(idx, 1);
-    });
-
-    winEl.querySelector('[data-role="deposit"]').addEventListener('click', () => submitOp(win, 'deposit'));
-    winEl.querySelector('[data-role="withdraw"]').addEventListener('click', () => submitOp(win, 'withdraw'));
-    refs.accountSel.addEventListener('change', () => renderBalance(win));
-
-    makeDraggable(winEl, winEl.querySelector('[data-role="drag-handle"]'));
-    winEl.addEventListener('mousedown', () => { winEl.style.zIndex = ++zTop; }, true);
-
-    renderBalance(win);
-    return win;
+  if (names.join(',') !== accounts.join(',')) {
+    accounts = names;
+    fillSelect($('account'), accounts);
+    fillSelect($('to'), accounts);
   }
+  refreshBalance();
+}
 
-  function renderBalance(win) {
-    const acc = win.refs.accountSel.value;
-    win.refs.balance.textContent = '$' + fakeBalances[acc].toLocaleString(undefined, {minimumFractionDigits: 2});
+function fillSelect(sel, names) {
+  const keep = sel.value;
+  sel.innerHTML = names.map(n => `<option value="${n}">${n}</option>`).join('');
+  if (names.includes(keep)) sel.value = keep;
+}
+
+function refreshBalance() {
+  const acct = $('account').value;
+  if (!lastView || !acct) return;
+
+  for (const s of lastView.shards) {
+    if (!(acct in s.accounts)) continue;
+
+    $('balance').textContent = money(s.accounts[acct]);
+    $('shardName').textContent = s.id + ' (leader ' + (s.leader || 'none') + ')';
+
+    const held = (s.reserved && s.reserved[acct]) || 0;
+    $('heldText').innerHTML = held
+      ? `<span class="held">${money(held)} reserved for an in-flight transfer</span>`
+      : 'nothing reserved';
+
+    // A shard with no leader cannot commit, so what is shown is the last known
+    // value. Saying so is the honest thing: a stale number presented as current
+    // is how a UI teaches the wrong lesson about a partitioned cluster.
+    const stale = !s.ready;
+    $('balance').className = stale ? 'balance stale' : 'balance';
+    $('staleNote').innerHTML = stale
+      ? ` &middot; <span style="color:var(--red)">shard not ready — this balance may be stale</span>`
+      : '';
+    return;
   }
+  $('balance').textContent = '—';
+}
 
-  function logLine(win, msg) {
-    const line = document.createElement('div');
-    line.textContent = msg;
-    win.refs.log.prepend(line);
+$('account').addEventListener('change', refreshBalance);
+
+// ---- sending ---------------------------------------------------------------
+
+function onOpChange() {
+  $('toWrap').style.display = $('op').value === 'transfer' ? '' : 'none';
+}
+
+function nextKey() {
+  const typed = $('key').value.trim();
+  if (typed) return typed;
+  return `${WINDOW_ID}-${Date.now().toString(36)}`;
+}
+
+async function submit(twice) {
+  const op = $('op').value;
+  const acct = $('account').value;
+  const amount = parseInt($('amount').value, 10) || 0;
+  const key = nextKey();
+
+  const params = new URLSearchParams({ op, key, amount: String(amount) });
+  if (op === 'deposit') params.set('to', acct);
+  else if (op === 'withdraw') params.set('from', acct);
+  else { params.set('from', acct); params.set('to', $('to').value); }
+
+  const label = op === 'transfer'
+    ? `${op} ${money(amount)} ${acct} → ${$('to').value}`
+    : `${op} ${money(amount)} ${acct}`;
+
+  if (twice) {
+    // Both requests in flight AT ONCE, not one after the other: a sequential
+    // "retry" would be answered from the idempotency cache and prove nothing
+    // about concurrency.
+    log('dim', `${label} — sending twice concurrently, key ${key}`);
+    const [a, b] = await Promise.all([send(params), send(params)]);
+    report(label + ' (1st)', a);
+    report(label + ' (2nd)', b);
+  } else {
+    report(label, await send(params));
   }
+}
 
-  function submitOp(win, kind) {
-    const acc = win.refs.accountSel.value;
-    const amt = parseFloat(win.refs.amount.value || '0');
-    if (!amt || amt <= 0) { logLine(win, 'Ignored: invalid amount'); return; }
-
-    win.refs.status.textContent = 'Sending request... (pending — see Cluster Dashboard for node status)';
-
-    // Mock round-trip delay to simulate consensus latency
-    setTimeout(() => {
-      if (kind === 'withdraw' && amt > fakeBalances[acc]) {
-        win.refs.status.textContent = 'Rejected: insufficient funds';
-        logLine(win, `Withdraw $${amt.toFixed(2)} REJECTED (insufficient funds)`);
-        return;
-      }
-      fakeBalances[acc] += (kind === 'deposit' ? amt : -amt);
-      // reflect the new balance in every open window watching this account
-      openWindows.forEach(w => { if (w.refs.accountSel.value === acc) renderBalance(w); });
-      win.refs.status.textContent = 'Committed.';
-      logLine(win, `${kind === 'deposit' ? 'Deposit' : 'Withdraw'} $${amt.toFixed(2)} committed — balance now $${fakeBalances[acc].toFixed(2)}`);
-    }, 400);
+async function send(params) {
+  try {
+    const r = await fetch('/api/tx?' + params.toString(), { method: 'POST' });
+    return await r.json();
+  } catch (err) {
+    return { ok: false, err: String(err) };
   }
+}
 
-  function makeDraggable(winEl, handle) {
-    let dragging = false, offsetX = 0, offsetY = 0;
-    handle.addEventListener('mousedown', (e) => {
-      dragging = true;
-      offsetX = e.clientX - winEl.offsetLeft;
-      offsetY = e.clientY - winEl.offsetTop;
-      e.preventDefault();
-    });
-    document.addEventListener('mousemove', (e) => {
-      if (!dragging) return;
-      let x = e.clientX - offsetX;
-      let y = e.clientY - offsetY;
-      x = Math.max(0, x);
-      y = Math.max(0, y);
-      winEl.style.left = x + 'px';
-      winEl.style.top = y + 'px';
-    });
-    document.addEventListener('mouseup', () => { dragging = false; });
+// The four client outcomes are kept DISTINCT here, because collapsing them is the
+// exact failure this project guards against: Indeterminate means the entry may
+// yet commit and must be retried with the SAME key, while a plain failure means
+// it did not happen. Showing both as "failed" would teach the wrong thing.
+function report(label, res) {
+  if (res.ok) {
+    log('ok', `<span class="outcome ok">COMMITTED</span>${label} → balance ${money(res.balance)}`);
+  } else if (res.indeterminate) {
+    log('warn', `<span class="outcome indeterminate">INDETERMINATE</span>${label} — ` +
+      `outcome unknown, retry with the SAME key. ${res.err || ''}`);
+  } else {
+    log('bad', `<span class="outcome failed">REFUSED</span>${label} — ${res.err || 'failed'}`);
   }
+}
 
-  // start with two windows so the "multiple windows" idea is visible immediately
-  spawnWindow('acc-1');
-  spawnWindow('acc-1');
+function log(cls, html) {
+  const el = $('log');
+  if (el.querySelector('.dim') && el.children.length === 1) el.innerHTML = '';
+  const line = document.createElement('div');
+  line.className = cls;
+  line.innerHTML = `<span class="dim">${new Date().toLocaleTimeString()}</span>  ${html}`;
+  el.prepend(line);
+}
+
+function openWindow() {
+  window.open(location.href, '_blank', 'width=560,height=760');
+}
+
+window.submit = submit;
+window.openWindow = openWindow;
+window.onOpChange = onOpChange;
 </script>
-
 </body>
 </html>

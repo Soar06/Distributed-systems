@@ -72,13 +72,33 @@ func (g *ShardGroup) Machine() *shard.Machine {
 // IsLeader implements shard.Group.
 func (g *ShardGroup) IsLeader() bool { return g.leader() != "" }
 
+// leader returns the group's leader in the HIGHEST term.
+//
+// The term comparison is not a detail. A partitioned leader keeps believing it
+// leads until it hears otherwise — Raft does not take leadership away from a node
+// that merely stops receiving replies — so after a failover there are genuinely
+// two servers reporting Leader: the stale one in the old term, and the real one
+// in the new term.
+//
+// Returning whichever came first in the id list picked the stale one about half
+// the time, and every proposal to it then timed out: it cannot reach a majority,
+// so its entries never commit. That is the same phantom-leader class the
+// phantom-quorum fix addressed at the RPC layer, and the answer is the same one
+// Raft itself uses — the higher term wins.
 func (g *ShardGroup) leader() raft.NodeID {
+	var best raft.NodeID
+	var bestTerm raft.Term
+
 	for _, id := range g.IDs {
-		if g.Nodes[id].Role() == raft.Leader {
-			return id
+		srv := g.Nodes[id]
+		if srv.Role() != raft.Leader {
+			continue
+		}
+		if term := srv.CurrentTerm(); best == "" || term > bestTerm {
+			best, bestTerm = id, term
 		}
 	}
-	return ""
+	return best
 }
 
 // ShardCluster is several ShardGroups plus the ring and coordinator.
@@ -91,7 +111,7 @@ type ShardCluster struct {
 
 // NewShardCluster builds nShards groups of nPerShard nodes each.
 func NewShardCluster(nShards, nPerShard int, seed int64) *ShardCluster {
-	cfg := raft.Config{ElectionTimeoutMin: 60, ElectionTimeoutMax: 120, HeartbeatInterval: 15}
+	cfg := simConfig()
 
 	var shardIDs []shard.ID
 	for i := range nShards {

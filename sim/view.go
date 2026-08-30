@@ -64,7 +64,7 @@ func (c *Cluster) View() ClusterView {
 			LastApplied: s.LastApplied(),
 			LogLength:   len(log) - 1, // exclude the sentinel
 			Log:         log,
-			Applied:     c.SMs[id].Snapshot(),
+			Applied:     c.SMs[id].AppliedCopy(),
 			Crashed:     crashed[id],
 			Partition:   parts[id],
 		})

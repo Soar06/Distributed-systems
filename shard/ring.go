@@ -73,6 +73,14 @@ func hashKey(s string) uint32 {
 	return crc32.ChecksumIEEE([]byte(s))
 }
 
+// HashKey exposes a key's position on the ring, for visualization.
+//
+// Exported so the dashboard draws the REAL placement rather than a decorative
+// approximation: a ring view that shows a key somewhere other than where the ring
+// actually puts it teaches the wrong thing, which for a view whose whole purpose
+// is to make placement visible would be worse than showing nothing.
+func HashKey(s string) uint32 { return hashKey(s) }
+
 // Lookup returns the shard owning key: the first shard clockwise from hash(key).
 func (r *Ring) Lookup(key string) ID {
 	if len(r.points) == 0 {
