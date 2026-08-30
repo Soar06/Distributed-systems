@@ -1,6 +1,10 @@
 package ledger
 
-import "fmt"
+import (
+	"fmt"
+
+	"github.com/homura/core-bank/hlc"
+)
 
 // internalKey namespaces 2PC bookkeeping keys away from client-supplied
 // idempotency keys, which share the same map. A client that chose the key
@@ -136,7 +140,7 @@ func (s *State) PrepareCredit(txID string, account AccountID, amount Money) Resu
 }
 
 // CommitDebit turns a reservation into a real debit.
-func (s *State) CommitDebit(txID string) Result {
+func (s *State) CommitDebit(txID string, ts hlc.Timestamp) Result {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -154,18 +158,25 @@ func (s *State) CommitDebit(txID string) Result {
 
 	s.balances[r.Account] -= r.Amount
 	delete(s.reserves, txID)
+	// Stamped with the transaction's own timestamp, so BOTH legs of a cross-shard
+	// transfer carry it.
+	//
+	// Without this the internal 2PC legs are the only unstamped transactions in
+	// the system — and they are precisely the ones Phase 3 exists to order, since
+	// they live in different Raft logs by construction and Seq cannot relate them.
 	s.record(Command{
 		Op:             OpTransfer,
 		IdempotencyKey: internalKey(txID, "debit"),
 		From:           r.Account,
 		Amount:         r.Amount,
+		Timestamp:      ts,
 	}, []Entry{{Account: r.Account, Amount: -r.Amount}})
 
 	return Result{OK: true, Balance: s.balances[r.Account]}
 }
 
 // CommitCredit applies the credit side.
-func (s *State) CommitCredit(txID string, account AccountID, amount Money) Result {
+func (s *State) CommitCredit(txID string, account AccountID, amount Money, ts hlc.Timestamp) Result {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -190,6 +201,7 @@ func (s *State) CommitCredit(txID string, account AccountID, amount Money) Resul
 		IdempotencyKey: key,
 		To:             account,
 		Amount:         amount,
+		Timestamp:      ts,
 	}, []Entry{{Account: account, Amount: amount}})
 
 	res := Result{OK: true, Balance: s.balances[account]}

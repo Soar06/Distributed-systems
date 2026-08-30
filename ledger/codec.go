@@ -4,7 +4,10 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"io"
 	"sync"
+
+	"github.com/homura/core-bank/hlc"
 )
 
 // Encoding of Command to and from the opaque []byte that Raft replicates.
@@ -30,6 +33,20 @@ func (c Command) Encode() []byte {
 	var amt [8]byte
 	binary.LittleEndian.PutUint64(amt[:], uint64(c.Amount))
 	b.Write(amt[:])
+
+	// The HLC timestamp is APPENDED, after every pre-existing field.
+	//
+	// Deliberate: a decoder reading a record written before this field existed
+	// simply finds no trailing bytes and leaves the zero value. Inserting it in
+	// the middle would make every previously-written WAL record undecodable, which
+	// for a bank means an unreadable audit trail — the log is the authoritative
+	// history, and a format change that orphans it destroys the thing being
+	// protected.
+	var ts [12]byte
+	binary.LittleEndian.PutUint64(ts[0:8], c.Timestamp.Wall)
+	binary.LittleEndian.PutUint32(ts[8:12], c.Timestamp.Logical)
+	b.Write(ts[:])
+
 	return b.Bytes()
 }
 
@@ -59,13 +76,30 @@ func Decode(data []byte) (Command, error) {
 		return Command{}, errBadEncoding
 	}
 
-	return Command{
+	cmd := Command{
 		Op:             Op(op),
 		IdempotencyKey: key,
 		From:           AccountID(from),
 		To:             AccountID(to),
 		Amount:         Money(binary.LittleEndian.Uint64(amt[:])),
-	}, nil
+	}
+
+	// The timestamp is optional on the wire: a record written before the field
+	// existed ends here, and leaving the zero value is exactly right — it means
+	// "unstamped", which is different from "stamped at time zero".
+	var ts [12]byte
+	if n, err := io.ReadFull(r, ts[:]); err == nil {
+		cmd.Timestamp = hlc.Timestamp{
+			Wall:    binary.LittleEndian.Uint64(ts[0:8]),
+			Logical: binary.LittleEndian.Uint32(ts[8:12]),
+		}
+	} else if n != 0 {
+		// Partially present: the record is truncated, not merely old. Refused
+		// rather than silently accepted with a half-read timestamp.
+		return Command{}, errBadEncoding
+	}
+
+	return cmd, nil
 }
 
 func writeStr(b *bytes.Buffer, s string) {
