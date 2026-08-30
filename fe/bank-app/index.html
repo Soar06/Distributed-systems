@@ -1,0 +1,286 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Core Bank — App</title>
+<style>
+  html, body {
+    height: 100%;
+    margin: 0;
+  }
+  body {
+    font-family: system-ui, sans-serif;
+    background: #e5e7eb;
+    background-image: radial-gradient(#d1d5db 1px, transparent 1px);
+    background-size: 18px 18px;
+    overflow: hidden;
+  }
+  .toolbar {
+    position: fixed;
+    top: 0; left: 0; right: 0;
+    height: 46px;
+    background: #1f2937;
+    color: white;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 0 14px;
+    z-index: 1000;
+    font-size: 13px;
+  }
+  .toolbar button {
+    background: #16a34a;
+    color: white;
+    border: none;
+    border-radius: 6px;
+    padding: 6px 12px;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  .toolbar select {
+    padding: 5px 8px;
+    border-radius: 6px;
+    border: none;
+    font-size: 13px;
+  }
+  .desk {
+    position: absolute;
+    top: 46px; left: 0; right: 0; bottom: 0;
+  }
+
+  .window {
+    position: absolute;
+    width: 300px;
+    background: white;
+    border-radius: 10px;
+    box-shadow: 0 4px 14px rgba(0,0,0,0.25);
+    overflow: hidden;
+    user-select: none;
+  }
+  .window.focused { box-shadow: 0 6px 20px rgba(0,0,0,0.4); }
+
+  .titlebar {
+    background: #1f2937;
+    color: white;
+    padding: 8px 10px;
+    font-size: 12px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    cursor: move;
+  }
+  .titlebar .close {
+    cursor: pointer;
+    opacity: 0.7;
+    padding: 0 4px;
+  }
+  .titlebar .close:hover { opacity: 1; color: #f87171; }
+
+  .body { padding: 14px; user-select: text; }
+  label { font-size: 11px; color: #555; display: block; margin-bottom: 4px; }
+  select, input {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 6px 8px;
+    margin-bottom: 10px;
+    border: 1px solid #ccc;
+    border-radius: 6px;
+    font-size: 13px;
+  }
+  .balance {
+    text-align: center;
+    padding: 12px 0;
+    margin-bottom: 10px;
+    background: #f0fdf4;
+    border-radius: 8px;
+  }
+  .balance .amount { font-size: 22px; font-weight: 700; color: #166534; }
+  .balance .label { font-size: 10px; color: #555; text-transform: uppercase; }
+  .actions { display: flex; gap: 8px; margin-bottom: 10px; }
+  .actions button {
+    flex: 1;
+    padding: 7px 0;
+    border: none;
+    border-radius: 6px;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  .deposit { background: #16a34a; color: white; }
+  .withdraw { background: #dc2626; color: white; }
+  .logbox {
+    font-size: 10.5px;
+    color: #444;
+    background: #f9fafb;
+    border: 1px solid #eee;
+    border-radius: 6px;
+    padding: 6px;
+    height: 70px;
+    overflow-y: auto;
+  }
+  .logbox div { margin-bottom: 3px; }
+  .status { font-size: 10.5px; margin-top: 6px; min-height: 14px; color: #a16207; }
+</style>
+</head>
+<body>
+
+<div class="toolbar">
+  <strong>Core Bank — Bank App</strong>
+  <span style="opacity:0.6;">|</span>
+  <label style="margin:0; color:#cbd5e1;">New window for:</label>
+  <select id="newAccount">
+    <option value="acc-1">Account A (acc-1)</option>
+    <option value="acc-2">Account B (acc-2)</option>
+    <option value="acc-3">Account C (acc-3)</option>
+  </select>
+  <button onclick="spawnWindow()">+ Add Window</button>
+  <span style="opacity:0.6; margin-left:auto;">Drag titlebars to move · shared fake balances across windows</span>
+</div>
+
+<div class="desk" id="desk"></div>
+
+<script>
+  // Static mockup only — no backend wired yet.
+  // Balances are shared across all spawned windows (module-level state),
+  // so two windows on the same account really do affect each other.
+  const fakeBalances = { 'acc-1': 1000, 'acc-2': 500, 'acc-3': 2500 };
+  const accountLabels = { 'acc-1': 'Account A', 'acc-2': 'Account B', 'acc-3': 'Account C' };
+
+  let windowCount = 0;
+  let zTop = 1;
+  const openWindows = []; // { id, account, el, refs:{balance, log, status} }
+
+  function spawnWindow(account) {
+    account = account || document.getElementById('newAccount').value;
+    windowCount++;
+    const id = windowCount;
+
+    const winEl = document.createElement('div');
+    winEl.className = 'window';
+    winEl.style.left = (30 + (windowCount % 6) * 40) + 'px';
+    winEl.style.top = (20 + (windowCount % 6) * 30) + 'px';
+    winEl.style.zIndex = ++zTop;
+
+    winEl.innerHTML = `
+      <div class="titlebar" data-role="drag-handle">
+        <span>Bank App — #${id}</span>
+        <span class="close" data-role="close">✕</span>
+      </div>
+      <div class="body">
+        <label>Account</label>
+        <select data-role="account">
+          <option value="acc-1">Account A (acc-1)</option>
+          <option value="acc-2">Account B (acc-2)</option>
+          <option value="acc-3">Account C (acc-3)</option>
+        </select>
+
+        <div class="balance">
+          <div class="amount" data-role="balance">$0.00</div>
+          <div class="label">Current Balance</div>
+        </div>
+
+        <label>Amount</label>
+        <input type="number" data-role="amount" placeholder="0.00" value="50">
+
+        <div class="actions">
+          <button class="deposit" data-role="deposit">Deposit</button>
+          <button class="withdraw" data-role="withdraw">Withdraw</button>
+        </div>
+
+        <div class="status" data-role="status"></div>
+
+        <label style="margin-top:8px;">Activity (this window)</label>
+        <div class="logbox" data-role="log"><div>Window #${id} opened (mock)</div></div>
+      </div>
+    `;
+
+    document.getElementById('desk').appendChild(winEl);
+
+    const refs = {
+      accountSel: winEl.querySelector('[data-role="account"]'),
+      balance: winEl.querySelector('[data-role="balance"]'),
+      amount: winEl.querySelector('[data-role="amount"]'),
+      status: winEl.querySelector('[data-role="status"]'),
+      log: winEl.querySelector('[data-role="log"]'),
+    };
+    refs.accountSel.value = account;
+
+    const win = { id, el: winEl, refs };
+    openWindows.push(win);
+
+    winEl.querySelector('[data-role="close"]').addEventListener('click', () => {
+      winEl.remove();
+      const idx = openWindows.indexOf(win);
+      if (idx >= 0) openWindows.splice(idx, 1);
+    });
+
+    winEl.querySelector('[data-role="deposit"]').addEventListener('click', () => submitOp(win, 'deposit'));
+    winEl.querySelector('[data-role="withdraw"]').addEventListener('click', () => submitOp(win, 'withdraw'));
+    refs.accountSel.addEventListener('change', () => renderBalance(win));
+
+    makeDraggable(winEl, winEl.querySelector('[data-role="drag-handle"]'));
+    winEl.addEventListener('mousedown', () => { winEl.style.zIndex = ++zTop; }, true);
+
+    renderBalance(win);
+    return win;
+  }
+
+  function renderBalance(win) {
+    const acc = win.refs.accountSel.value;
+    win.refs.balance.textContent = '$' + fakeBalances[acc].toLocaleString(undefined, {minimumFractionDigits: 2});
+  }
+
+  function logLine(win, msg) {
+    const line = document.createElement('div');
+    line.textContent = msg;
+    win.refs.log.prepend(line);
+  }
+
+  function submitOp(win, kind) {
+    const acc = win.refs.accountSel.value;
+    const amt = parseFloat(win.refs.amount.value || '0');
+    if (!amt || amt <= 0) { logLine(win, 'Ignored: invalid amount'); return; }
+
+    win.refs.status.textContent = 'Sending request... (pending — see Cluster Dashboard for node status)';
+
+    // Mock round-trip delay to simulate consensus latency
+    setTimeout(() => {
+      if (kind === 'withdraw' && amt > fakeBalances[acc]) {
+        win.refs.status.textContent = 'Rejected: insufficient funds';
+        logLine(win, `Withdraw $${amt.toFixed(2)} REJECTED (insufficient funds)`);
+        return;
+      }
+      fakeBalances[acc] += (kind === 'deposit' ? amt : -amt);
+      // reflect the new balance in every open window watching this account
+      openWindows.forEach(w => { if (w.refs.accountSel.value === acc) renderBalance(w); });
+      win.refs.status.textContent = 'Committed.';
+      logLine(win, `${kind === 'deposit' ? 'Deposit' : 'Withdraw'} $${amt.toFixed(2)} committed — balance now $${fakeBalances[acc].toFixed(2)}`);
+    }, 400);
+  }
+
+  function makeDraggable(winEl, handle) {
+    let dragging = false, offsetX = 0, offsetY = 0;
+    handle.addEventListener('mousedown', (e) => {
+      dragging = true;
+      offsetX = e.clientX - winEl.offsetLeft;
+      offsetY = e.clientY - winEl.offsetTop;
+      e.preventDefault();
+    });
+    document.addEventListener('mousemove', (e) => {
+      if (!dragging) return;
+      let x = e.clientX - offsetX;
+      let y = e.clientY - offsetY;
+      x = Math.max(0, x);
+      y = Math.max(0, y);
+      winEl.style.left = x + 'px';
+      winEl.style.top = y + 'px';
+    });
+    document.addEventListener('mouseup', () => { dragging = false; });
+  }
+
+  // start with two windows so the "multiple windows" idea is visible immediately
+  spawnWindow('acc-1');
+  spawnWindow('acc-1');
+</script>
+
+</body>
+</html>

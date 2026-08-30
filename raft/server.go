@@ -1,0 +1,409 @@
+package raft
+
+import (
+	"math/rand"
+	"sync"
+	"time"
+)
+
+// Server is one Raft node: one Go process's worth of consensus state.
+//
+// Concurrency: a single mutex guards all mutable state. This is deliberate for
+// Phase 1 — readability over performance, since races in consensus code are the
+// hardest class of bug to find (context/DESIGN.md §2). Every exported method
+// takes the lock; unexported helpers assume it is already held.
+type Server struct {
+	mu sync.Mutex
+
+	id    NodeID
+	peers []NodeID // the full cluster, INCLUDING this server
+
+	// --- Persistent state on all servers (Figure 2) ---
+	// Must be durable before responding to RPCs.
+	currentTerm Term
+	votedFor    *NodeID
+	log         []LogEntry
+
+	// --- Volatile state on all servers (Figure 2) ---
+	commitIndex Index
+	lastApplied Index
+
+	// --- Volatile state on leaders (Figure 2), reinitialized after election ---
+	nextIndex  map[NodeID]Index
+	matchIndex map[NodeID]Index
+
+	role Role
+
+	// leaderID is the leader this server last heard from, so a follower can tell
+	// a client where to go (§8: a non-leader rejects and redirects).
+	leaderID NodeID
+
+	// sm is the replicated application. Committed entries are applied to it in
+	// log order, exactly once, on every server.
+	sm StateMachine
+
+	// --- role loop machinery (loop.go) ---
+
+	cfg       Config
+	transport Transport
+	rnd       *rand.Rand
+
+	// storage persists currentTerm, votedFor, and log[] before RPC replies
+	// (Figure 2). Nil means in-memory only — tests that do not exercise
+	// durability.
+	storage Storage
+
+	// electionDeadline is when this server will start an election if it has not
+	// heard from a leader. heartbeatDeadline is when a leader next sends
+	// heartbeats.
+	electionDeadline  time.Time
+	heartbeatDeadline time.Time
+
+	running bool
+
+	// stopped latches true on Stop and never clears. running only tracks whether
+	// the role loop goroutine is live; stopped is the durable statement that this
+	// node has left the cluster and must no longer be counted toward any quorum.
+	stopped bool
+	stopCh  chan struct{}
+	wg      sync.WaitGroup
+
+	// applyWaiters are closed when lastApplied reaches their index. This lets a
+	// caller await its own entry without polling — polling with sleeps made
+	// measured throughput a function of timer granularity rather than of the
+	// system under test.
+	applyWaiters map[Index][]chan struct{}
+
+	// appliedErrs counts failures to persist the applied marker, with the most
+	// recent error. Not fatal (replay is idempotent), but not silent either.
+	appliedErrs    int
+	lastAppliedErr error
+}
+
+// WaitApplied returns a channel closed once the entry at idx has been applied.
+func (s *Server) WaitApplied(idx Index) <-chan struct{} {
+	ch := make(chan struct{})
+	s.mu.Lock()
+	if s.lastApplied >= idx {
+		s.mu.Unlock()
+		close(ch)
+		return ch
+	}
+	if s.applyWaiters == nil {
+		s.applyWaiters = make(map[Index][]chan struct{})
+	}
+	s.applyWaiters[idx] = append(s.applyWaiters[idx], ch)
+	s.mu.Unlock()
+	return ch
+}
+
+// signalApplied wakes anyone waiting for indices up to and including
+// s.lastApplied. Caller must hold s.mu.
+func (s *Server) signalApplied() {
+	for idx, chans := range s.applyWaiters {
+		if idx <= s.lastApplied {
+			for _, ch := range chans {
+				close(ch)
+			}
+			delete(s.applyWaiters, idx)
+		}
+	}
+}
+
+// NewServer creates a follower with an empty log, using default timings and no
+// transport. Suitable for testing the RPC receiver rules in isolation; use
+// NewServerWith to run the role loop.
+//
+// peers must include id itself: majority calculations are defined over the full
+// cluster (§5.2). All servers start as followers with term 0 (Figure 2, "State").
+func NewServer(id NodeID, peers []NodeID, sm StateMachine) *Server {
+	return NewServerWith(id, peers, sm, nil, DefaultConfig(), 1)
+}
+
+// SetStorage attaches durable storage. Must be called before Start, and is
+// normally followed by Restore.
+func (s *Server) SetStorage(st Storage) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.storage = st
+}
+
+// NewServerWith creates a server with an explicit transport, timing config, and
+// random seed.
+//
+// The seed is explicit so that a chaos run is reproducible: an unreproducible
+// consensus bug is close to impossible to fix (learn/READING_LIST.md §5).
+func NewServerWith(id NodeID, peers []NodeID, sm StateMachine, tr Transport, cfg Config, seed int64) *Server {
+	return &Server{
+		id:    id,
+		peers: peers,
+		// log[0] is the sentinel so real entries start at index 1, matching the
+		// paper's 1-based log.
+		log:        []LogEntry{{Term: 0, Index: 0}},
+		role:       Follower,
+		nextIndex:  make(map[NodeID]Index),
+		matchIndex: make(map[NodeID]Index),
+		sm:         sm,
+		cfg:        cfg,
+		transport:  tr,
+		rnd:        newRand(seed),
+	}
+}
+
+// ID returns this server's identifier.
+func (s *Server) ID() NodeID { return s.id }
+
+// Role returns the server's current role.
+func (s *Server) Role() Role {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.role
+}
+
+// CurrentTerm returns the server's current term.
+func (s *Server) CurrentTerm() Term {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.currentTerm
+}
+
+// CommitIndex returns the highest log index known to be committed.
+func (s *Server) CommitIndex() Index {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.commitIndex
+}
+
+// LastApplied returns the highest log index applied to the state machine.
+func (s *Server) LastApplied() Index {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastApplied
+}
+
+// AppliedPersistFailures returns how many times the applied marker failed to
+// persist, and the most recent error. A non-zero count means restarts will replay
+// more of the log than necessary, and that storage is unhealthy.
+func (s *Server) AppliedPersistFailures() (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.appliedErrs, s.lastAppliedErr
+}
+
+// LogEntries returns a copy of the log, sentinel included. For tests and for the
+// cluster dashboard (NOW.md Phase 4); a copy so callers cannot mutate consensus
+// state.
+func (s *Server) LogEntries() []LogEntry {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]LogEntry, len(s.log))
+	copy(out, s.log)
+	return out
+}
+
+// becomeFollower converts to follower at the given term. Caller must hold s.mu.
+//
+// This implements the "All Servers" rule from Figure 2: if an RPC request or
+// response contains term T > currentTerm, set currentTerm = T and convert to
+// follower. That rule is unconditional and applies in every role — it is the most
+// commonly missed line in Figure 2, so it lives in one place here.
+func (s *Server) becomeFollower(term Term) {
+	s.role = Follower
+	if term > s.currentTerm {
+		s.currentTerm = term
+		s.votedFor = nil // a new term means the vote has not been cast yet
+	}
+}
+
+// observeTerm applies the "All Servers" term rule for any incoming term.
+// Reports whether the server stepped down. Caller must hold s.mu.
+func (s *Server) observeTerm(t Term) bool {
+	if t > s.currentTerm {
+		s.becomeFollower(t)
+		return true
+	}
+	return false
+}
+
+// AppendEntries handles the AppendEntries RPC (Figure 2, §5.3).
+//
+// Receiver implementation, in the paper's order:
+//  1. Reply false if term < currentTerm.
+//  2. Reply false if the log has no entry at prevLogIndex whose term matches
+//     prevLogTerm.
+//  3. If an existing entry conflicts with a new one, delete it and all that follow.
+//  4. Append any new entries not already in the log.
+//  5. If leaderCommit > commitIndex, set commitIndex =
+//     min(leaderCommit, index of last new entry).
+func (s *Server) AppendEntries(args AppendEntriesArgs) AppendEntriesReply {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// A stopped node must not participate in consensus.
+	//
+	// Without this, a node shut down for a rolling restart kept ACKING
+	// replication over the leader's already-open connection: the leader counted
+	// it toward the majority, committed, and told the client the money moved —
+	// against a quorum that no longer existed. The entry survived on one disk.
+	// The deploy looked healthy right up until the processes actually exited.
+	if s.stopped {
+		return AppendEntriesReply{Term: s.currentTerm, Success: false}
+	}
+
+	// Rule 1: reject a stale leader without touching our log.
+	if args.Term < s.currentTerm {
+		return AppendEntriesReply{Term: s.currentTerm, Success: false}
+	}
+
+	// All Servers rule: a term at least as large means this leader is current, so
+	// step down. Note >= rather than >: a candidate that receives AppendEntries
+	// from a leader in the SAME term must also convert to follower (Figure 2,
+	// "Candidates"), since that leader already won this term's election.
+	termChanged := s.observeTerm(args.Term)
+	if s.role == Candidate && args.Term == s.currentTerm {
+		s.role = Follower
+	}
+
+	// Remember who the leader is so clients can be redirected.
+	s.leaderID = args.LeaderID
+
+	// A valid leader is alive, so do not challenge it: reset the election timer
+	// (Figure 2, "Followers"). This happens even if the log check below fails —
+	// a log inconsistency means we are behind, not that the leader is invalid,
+	// and starting an election here would disrupt a healthy cluster.
+	s.resetElectionTimerLocked()
+
+	// Rule 2: log consistency check.
+	if !s.matchesPrevLog(args.PrevLogIndex, args.PrevLogTerm) {
+		// Even on rejection, an adopted higher term must be durable before we
+		// reply — otherwise a restart could resurrect the old term and re-vote.
+		if termChanged {
+			s.mustPersistLocked()
+		}
+		return AppendEntriesReply{Term: s.currentTerm, Success: false}
+	}
+
+	// Rules 3 and 4.
+	changed := s.appendFrom(args.PrevLogIndex, args.Entries)
+
+	// Figure 2: persistent state must be durable BEFORE we reply. A follower that
+	// acknowledges entries it has not durably stored can lose them on restart
+	// while the leader believes they are replicated.
+	if changed || termChanged {
+		s.mustPersistLocked()
+	}
+
+	// Rule 5. The min() matters: the leader's commitIndex may be ahead of what it
+	// has actually sent us, and committing entries we do not hold would break
+	// State Machine Safety.
+	if args.LeaderCommit > s.commitIndex {
+		lastNew := args.PrevLogIndex + Index(len(args.Entries))
+		s.commitIndex = min(args.LeaderCommit, lastNew)
+		s.applyCommitted()
+	}
+
+	return AppendEntriesReply{Term: s.currentTerm, Success: true}
+}
+
+// RequestVote handles the RequestVote RPC (Figure 2, §5.2).
+//
+// Receiver implementation:
+//  1. Reply false if term < currentTerm.
+//  2. If votedFor is null or candidateId, and the candidate's log is at least as
+//     up-to-date as the receiver's log, grant vote (§5.2, §5.4).
+func (s *Server) RequestVote(args RequestVoteArgs) RequestVoteReply {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// A stopped node must not vote: see AppendEntries.
+	if s.stopped {
+		return RequestVoteReply{Term: s.currentTerm, VoteGranted: false}
+	}
+
+	// Rule 1.
+	if args.Term < s.currentTerm {
+		return RequestVoteReply{Term: s.currentTerm, VoteGranted: false}
+	}
+
+	// All Servers rule: a higher term makes us a follower and clears votedFor,
+	// which is what allows us to vote in this newer term.
+	termChanged := s.observeTerm(args.Term)
+
+	// Rule 2. Both halves are required: the votedFor check gives at most one vote
+	// per term (Election Safety), and the up-to-date check stops a candidate that
+	// is missing committed entries from winning (Leader Completeness).
+	alreadyVoted := s.votedFor != nil && *s.votedFor != args.CandidateID
+	if alreadyVoted || !s.isUpToDate(args.LastLogIndex, args.LastLogTerm) {
+		if termChanged {
+			s.mustPersistLocked()
+		}
+		return RequestVoteReply{Term: s.currentTerm, VoteGranted: false}
+	}
+
+	cand := args.CandidateID
+	s.votedFor = &cand
+
+	// "...without receiving AppendEntries RPC from current leader or granting
+	// vote to candidate" — granting a vote also defers our own election, giving
+	// the candidate we just endorsed time to win.
+	s.resetElectionTimerLocked()
+
+	// THE critical persist. If this vote is not durable before we reply, a crash
+	// and restart can make this server forget it voted and grant a second vote in
+	// the same term — producing two leaders and violating Election Safety.
+	s.mustPersistLocked()
+
+	return RequestVoteReply{Term: s.currentTerm, VoteGranted: true}
+}
+
+// applyCommitted applies newly committed entries to the state machine in log
+// order. Caller must hold s.mu.
+//
+// Figure 2, "All Servers": if commitIndex > lastApplied, increment lastApplied
+// and apply log[lastApplied]. Advancing one index at a time, in order, is what
+// gives State Machine Safety: no server ever applies a different entry at a given
+// index than another server did.
+func (s *Server) applyCommitted() {
+	for s.commitIndex > s.lastApplied {
+		s.lastApplied++
+		e, ok := s.entryAt(s.lastApplied)
+		if !ok {
+			// Cannot happen: commitIndex never exceeds the last log index.
+			s.lastApplied--
+			return
+		}
+		if s.sm != nil && e.Command != nil {
+			if ism, ok := s.sm.(IndexedStateMachine); ok {
+				ism.ApplyAt(e.Index, e.Command)
+			} else {
+				s.sm.Apply(e.Command)
+			}
+		}
+	}
+
+	// Record how far we have applied, so a restart can replay to the same point.
+	//
+	// Written AFTER the entries are applied: if we crash in between, replay redoes
+	// the tail, which is safe because applying the same log in the same order is
+	// deterministic and the state machine's idempotency keys absorb the repeat.
+	//
+	// Deliberately NOT fatal, unlike a failed Raft-state persist. A lost applied
+	// marker only costs replay work on restart — it cannot corrupt anything,
+	// because replaying is idempotent. But it must not be silently ignored either:
+	// the failure is recorded so an operator can see storage degrading.
+	//
+	// Written inline. An earlier version handed this to a background goroutine to
+	// keep the fsync off the lock, but that raced shutdown: a node stopped
+	// promptly after applying could exit before the marker was written, so the
+	// restart replayed from a stale index and lost 2PC decisions. Correctness of
+	// the recovery path outranks the latency saving; the marker write is a small
+	// fixed-size file.
+	if as, ok := s.storage.(AppliedStorage); ok && s.lastApplied > 0 {
+		if err := as.SaveApplied(uint64(s.lastApplied)); err != nil {
+			s.appliedErrs++
+			s.lastAppliedErr = err
+		}
+	}
+
+	s.signalApplied()
+}

@@ -1,0 +1,345 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Core Bank — Cluster Dashboard</title>
+<style>
+  body {
+    font-family: system-ui, sans-serif;
+    background: #0f1115;
+    color: #e5e7eb;
+    margin: 0;
+    padding: 20px;
+  }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  .sub { font-size: 12px; color: #9ca3af; margin-bottom: 20px; }
+  .grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 20px;
+  }
+  .panel {
+    background: #171a21;
+    border: 1px solid #262b36;
+    border-radius: 10px;
+    padding: 14px;
+  }
+  .panel h2 {
+    font-size: 13px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: #9ca3af;
+    margin: 0 0 12px;
+  }
+
+  /* node cards */
+  .nodes { display: flex; gap: 10px; flex-wrap: wrap; }
+  .node {
+    flex: 1;
+    min-width: 130px;
+    border-radius: 8px;
+    padding: 10px;
+    border: 1px solid #2a2f3a;
+    background: #1d212b;
+  }
+  .node .name { font-size: 13px; font-weight: 600; margin-bottom: 6px; }
+  .role {
+    display: inline-block;
+    font-size: 10px;
+    padding: 2px 6px;
+    border-radius: 4px;
+    margin-bottom: 8px;
+    font-weight: 600;
+  }
+  .role.leader { background: #16a34a33; color: #4ade80; }
+  .role.follower { background: #2563eb33; color: #60a5fa; }
+  .role.candidate { background: #ca8a0433; color: #facc15; }
+  .req-status {
+    font-size: 11px;
+    padding: 4px 6px;
+    border-radius: 4px;
+    margin-top: 6px;
+  }
+  .req-status.pending { background: #ca8a0422; color: #facc15; }
+  .req-status.committed { background: #16a34a22; color: #4ade80; }
+  .req-status.waiting { background: #37415133; color: #9ca3af; }
+  .datarow { font-size: 11px; color: #9ca3af; margin-top: 4px; }
+
+  /* hash ring */
+  .ring-wrap { display: flex; justify-content: center; }
+  svg text { fill: #e5e7eb; font-size: 10px; }
+
+  /* collision panel */
+  .collision-log {
+    font-size: 12px;
+    font-family: ui-monospace, monospace;
+    background: #0f1115;
+    border: 1px solid #262b36;
+    border-radius: 6px;
+    padding: 10px;
+    height: 160px;
+    overflow-y: auto;
+  }
+  .collision-log div { margin-bottom: 4px; }
+  .collision-log .a { color: #60a5fa; }
+  .collision-log .b { color: #f472b6; }
+  .collision-log .sys { color: #9ca3af; }
+
+  button.sim {
+    margin-top: 10px;
+    background: #374151;
+    color: #e5e7eb;
+    border: 1px solid #4b5563;
+    border-radius: 6px;
+    padding: 6px 12px;
+    font-size: 12px;
+    cursor: pointer;
+  }
+
+  .node { cursor: pointer; transition: border-color 0.15s, background 0.15s; }
+  .node:hover { border-color: #4b5563; }
+  .node.selected { border-color: #60a5fa; background: #1e2530; }
+
+  svg .ring-node { cursor: pointer; }
+  svg .ring-node circle { transition: stroke 0.15s, stroke-width 0.15s; }
+  svg .ring-node.selected circle { stroke: #60a5fa; stroke-width: 3px; }
+
+  /* node detail panel */
+  #nodeDetail { display: none; }
+  #nodeDetail.open { display: block; }
+  .detail-empty { font-size: 12px; color: #6b7280; font-style: italic; }
+  .detail-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 10px;
+  }
+  .detail-head .title { font-size: 14px; font-weight: 600; }
+  .kv-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  .kv-table th {
+    text-align: left;
+    color: #9ca3af;
+    font-weight: 500;
+    padding: 4px 6px;
+    border-bottom: 1px solid #262b36;
+  }
+  .kv-table td {
+    padding: 4px 6px;
+    border-bottom: 1px solid #1c2028;
+    font-family: ui-monospace, monospace;
+  }
+  .range-pill {
+    display: inline-block;
+    font-size: 11px;
+    background: #1d212b;
+    border: 1px solid #2a2f3a;
+    border-radius: 4px;
+    padding: 3px 8px;
+    color: #9ca3af;
+    margin-bottom: 10px;
+  }
+</style>
+</head>
+<body>
+
+<h1>Core Bank — Cluster Dashboard</h1>
+<div class="sub">Mock data only — not yet wired to backend. Layout preview for Phase 4. Click a node (card or ring dot) to inspect its stored data.</div>
+
+<div class="grid">
+
+  <div class="panel">
+    <h2>Nodes</h2>
+    <div class="nodes" id="nodes"></div>
+  </div>
+
+  <div class="panel">
+    <h2>Hash Ring (single Raft group — Phase 1)</h2>
+    <div class="ring-wrap">
+      <svg width="220" height="220" viewBox="0 0 220 220"></svg>
+    </div>
+  </div>
+
+  <div class="panel" style="grid-column: 1 / span 2;">
+    <h2>Node Detail</h2>
+    <div id="nodeDetailEmpty" class="detail-empty">No node selected — click a node card or ring dot above.</div>
+    <div id="nodeDetail">
+      <div class="detail-head">
+        <span class="title" id="detailTitle">node-1</span>
+        <span class="role" id="detailRole">LEADER</span>
+      </div>
+      <div class="range-pill" id="detailRange">hash range: 0x0000 – 0x5555</div>
+      <table class="kv-table">
+        <thead><tr><th>Account</th><th>Balance</th><th>Last log idx</th></tr></thead>
+        <tbody id="detailRows"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="panel" style="grid-column: 1 / span 2;">
+    <h2>Same-Account Collision Monitor</h2>
+    <div class="collision-log" id="collisionLog">
+      <div class="sys">Waiting for concurrent requests on the same account...</div>
+    </div>
+    <button class="sim" onclick="simulateCollision()">Simulate collision (mock)</button>
+  </div>
+
+</div>
+
+<script>
+  // mock hash range + stored accounts per node (Phase 1: all 3 nodes replicate the
+  // same single Raft group, so ranges cover the whole ring and data is identical —
+  // this becomes real per-node partitioning once Phase 2 sharding lands)
+  const nodesData = [
+    {
+      name: 'node-1', role: 'leader',
+      data: 'log: 42 entries, balance acc-1=$1000',
+      hashRange: '0x0000 – 0x5555',
+      accounts: [
+        { id: 'acc-1', balance: 1000, lastIdx: 42 },
+        { id: 'acc-2', balance: 500,  lastIdx: 40 },
+        { id: 'acc-3', balance: 2500, lastIdx: 41 },
+      ],
+    },
+    {
+      name: 'node-2', role: 'follower',
+      data: 'log: 42 entries, in sync',
+      hashRange: '0x5556 – 0xAAAA',
+      accounts: [
+        { id: 'acc-1', balance: 1000, lastIdx: 42 },
+        { id: 'acc-2', balance: 500,  lastIdx: 40 },
+        { id: 'acc-3', balance: 2500, lastIdx: 41 },
+      ],
+    },
+    {
+      name: 'node-3', role: 'follower',
+      data: 'log: 41 entries, replicating...',
+      hashRange: '0xAAAB – 0xFFFF',
+      accounts: [
+        { id: 'acc-1', balance: 1000, lastIdx: 41 },
+        { id: 'acc-2', balance: 500,  lastIdx: 40 },
+        { id: 'acc-3', balance: 2500, lastIdx: 41 },
+      ],
+    },
+  ];
+
+  let selectedNode = null;
+
+  function renderNodes() {
+    const container = document.getElementById('nodes');
+    container.innerHTML = '';
+    nodesData.forEach(n => {
+      const div = document.createElement('div');
+      div.className = 'node' + (selectedNode === n.name ? ' selected' : '');
+      div.innerHTML = `
+        <div class="name">${n.name}</div>
+        <span class="role ${n.role}">${n.role.toUpperCase()}</span>
+        <div class="datarow">${n.data}</div>
+        <div class="req-status waiting" id="req-${n.name}">idle</div>
+      `;
+      div.addEventListener('click', () => selectNode(n.name));
+      container.appendChild(div);
+    });
+  }
+  renderNodes();
+
+  // simple hash ring drawing (3 nodes, evenly spaced, mock)
+  function drawRing() {
+    const svg = document.querySelector('svg');
+    const cx = 110, cy = 110, r = 80;
+    svg.innerHTML = `<circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="#2a2f3a" stroke-width="2"/>`;
+    nodesData.forEach((n, i) => {
+      const angle = (i / nodesData.length) * 2 * Math.PI - Math.PI / 2;
+      const x = cx + r * Math.cos(angle);
+      const y = cy + r * Math.sin(angle);
+      const g = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+      g.setAttribute('class', 'ring-node' + (selectedNode === n.name ? ' selected' : ''));
+      g.innerHTML = `
+        <circle cx="${x}" cy="${y}" r="10" fill="${n.role === 'leader' ? '#16a34a' : '#2563eb'}" stroke="transparent"/>
+        <text x="${x}" y="${y - 16}" text-anchor="middle">${n.name}</text>
+      `;
+      g.addEventListener('click', () => selectNode(n.name));
+      svg.appendChild(g);
+    });
+    const centerLabel = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+    centerLabel.setAttribute('x', cx);
+    centerLabel.setAttribute('y', cy);
+    centerLabel.setAttribute('text-anchor', 'middle');
+    centerLabel.setAttribute('fill', '#9ca3af');
+    centerLabel.textContent = 'acc-1..N';
+    svg.appendChild(centerLabel);
+  }
+  drawRing();
+
+  function selectNode(name) {
+    selectedNode = name;
+    renderNodes();
+    drawRing();
+    renderDetail();
+  }
+
+  function renderDetail() {
+    const emptyEl = document.getElementById('nodeDetailEmpty');
+    const detailEl = document.getElementById('nodeDetail');
+    if (!selectedNode) {
+      emptyEl.style.display = 'block';
+      detailEl.classList.remove('open');
+      return;
+    }
+    const n = nodesData.find(x => x.name === selectedNode);
+    emptyEl.style.display = 'none';
+    detailEl.classList.add('open');
+
+    document.getElementById('detailTitle').textContent = n.name;
+    const roleEl = document.getElementById('detailRole');
+    roleEl.textContent = n.role.toUpperCase();
+    roleEl.className = 'role ' + n.role;
+    document.getElementById('detailRange').textContent = 'hash range: ' + n.hashRange;
+
+    const rows = document.getElementById('detailRows');
+    rows.innerHTML = n.accounts.map(a => `
+      <tr>
+        <td>${a.id}</td>
+        <td>$${a.balance.toLocaleString(undefined, {minimumFractionDigits: 2})}</td>
+        <td>${a.lastIdx}</td>
+      </tr>
+    `).join('');
+  }
+  renderDetail();
+
+  function logCollision(msg, cls) {
+    const line = document.createElement('div');
+    line.className = cls || '';
+    line.textContent = msg;
+    document.getElementById('collisionLog').prepend(line);
+  }
+
+  function setReqStatus(nodeName, status, text) {
+    const el = document.getElementById('req-' + nodeName);
+    el.className = 'req-status ' + status;
+    el.textContent = text;
+  }
+
+  function simulateCollision() {
+    logCollision('--- Window A and Window B both sent withdraw($80) on acc-1 ---', 'sys');
+    logCollision('Window A: withdraw $80 -> leader (node-1)', 'a');
+    logCollision('Window B: withdraw $80 -> leader (node-1)', 'b');
+
+    nodesData.forEach(n => setReqStatus(n.name, 'pending', 'pending...'));
+
+    setTimeout(() => {
+      logCollision('Leader orders A before B in the log (index 43)', 'sys');
+      setReqStatus('node-1', 'committed', 'A committed (idx 43)');
+      setReqStatus('node-2', 'pending', 'replicating idx 43...');
+      setReqStatus('node-3', 'pending', 'replicating idx 43...');
+    }, 500);
+
+    setTimeout(() => {
+      logCollision('A committed cluster-wide. Balance now $920.', 'a');
+      logCollision('B evaluated against updated balance ($920) -> insufficient? depends on backend rule (TBD)', 'sys');
+      nodesData.forEach(n => setReqStatus(n.name, 'committed', 'in sync (idx 44)'));
+    }, 1400);
+  }
+</script>
+
+</body>
+</html>
