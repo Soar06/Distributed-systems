@@ -23,6 +23,17 @@ type TxArgs struct {
 	IdempotencyKey string
 	From, To       string
 	Amount         int64 // minor units (cents)
+
+	// Token authenticates the caller when the node is configured with a client
+	// token. Checked before the command is proposed — an unauthenticated write
+	// must never reach the log, since a rejected entry that already replicated is
+	// indistinguishable to the ledger from an accepted one.
+	Token string
+
+	// ClientID identifies the caller for per-client rate limiting. Callers that
+	// omit it share one bucket rather than being exempt, since exempting them
+	// would make the limit bypassable by leaving the field empty.
+	ClientID string
 }
 
 // TxReply is the outcome of a write.
@@ -46,11 +57,38 @@ type TxReply struct {
 	// recording a failure — treating this as "did not happen" is how a real
 	// transfer gets double-sent or wrongly reversed.
 	Indeterminate bool
+
+	// Unauthenticated means the caller presented no valid token. Distinct from an
+	// ordinary failure: nothing was proposed, so there is nothing to retry until
+	// the caller has credentials. Never set together with Indeterminate.
+	Unauthenticated bool
+
+	// Busy means the request was SHED: the node is at its in-flight limit, or the
+	// caller is over its rate budget. Nothing was proposed.
+	//
+	// Distinct from Indeterminate, and the distinction is the whole point of
+	// bounding the queue. Indeterminate means "the entry may yet commit, retry with
+	// the same key". Busy means "no entry exists, retry whenever you like". An
+	// unbounded queue turns every overloaded request into the first, more dangerous
+	// answer; bounding it turns them into the second.
+	Busy bool
+
+	// RetryAfter advises how long to wait before retrying a Busy reply. Advisory,
+	// but it is what stops a shed client from retrying immediately and making the
+	// overload worse.
+	RetryAfter time.Duration
 }
 
 // BalanceArgs requests one account's balance.
 type BalanceArgs struct {
 	Account string
+
+	// Token authenticates the caller. Reads are authenticated too: every balance
+	// in the bank is readable from this endpoint.
+	Token string
+
+	// ClientID identifies the caller for per-client rate limiting.
+	ClientID string
 
 	// Linearizable requests a read that is guaranteed not to be stale, at the
 	// cost of a round trip to a majority (§8). A false value permits a local read
@@ -70,6 +108,13 @@ type BalanceReply struct {
 
 	// Stale reports whether the read bypassed the linearizability check.
 	Stale bool
+
+	// Unauthenticated means the caller presented no valid token.
+	Unauthenticated bool
+
+	// Busy means the read was shed. Nothing was read; retrying is safe.
+	Busy       bool
+	RetryAfter time.Duration
 }
 
 // StatusReply describes a node, for the cluster dashboard.
@@ -92,15 +137,40 @@ type ClientService struct {
 
 	// commitTimeout bounds how long a write waits for its entry to be applied.
 	commitTimeout time.Duration
+
+	// auth checks client bearer tokens. The zero value permits everything, which
+	// keeps local development and the existing tests working.
+	auth tokenAuth
+
+	// admit applies backpressure and rate limiting. Nil disables both.
+	admit *Admitter
 }
 
-// NewClientService builds the client API.
+// SetLimits attaches admission control. Must be called before serving.
+func (c *ClientService) SetLimits(l Limits) {
+	c.admit = NewAdmitter(l)
+}
+
+// Admitter exposes the admission controller, for metrics.
+func (c *ClientService) Admitter() *Admitter { return c.admit }
+
+// NewClientService builds the client API with no client authentication.
 func NewClientService(s *raft.Server, m *ledger.Machine, addrs map[raft.NodeID]string) *ClientService {
+	return NewClientServiceAuth(s, m, addrs, "")
+}
+
+// NewClientServiceAuth builds the client API requiring the given bearer token.
+// An empty token disables client authentication.
+func NewClientServiceAuth(s *raft.Server, m *ledger.Machine, addrs map[raft.NodeID]string, token string) *ClientService {
 	return &ClientService{
 		raftSrv:       s,
 		machine:       m,
 		addrs:         addrs,
 		commitTimeout: 5 * time.Second,
+		auth:          tokenAuth{token: token},
+		// Always present, even with no limits configured: it is what makes
+		// graceful shutdown work on a node that never opted into backpressure.
+		admit: NewAdmitter(Limits{}),
 	}
 }
 
@@ -120,6 +190,28 @@ func (c *ClientService) leaderAddr() string {
 // earlier would tell the client their money moved before the cluster agreed it
 // did.
 func (c *ClientService) Submit(args TxArgs, reply *TxReply) error {
+	// Checked before anything else: an unauthenticated write must not reach the
+	// log. Saltzer & Schroeder's complete mediation — every access checked, with
+	// no path that skips the check (learn/READING_LIST.md §13).
+	if !c.auth.check(args.Token) {
+		reply.Unauthenticated = true
+		reply.Err = ErrUnauthenticated
+		return nil
+	}
+
+	// Admission control runs AFTER authentication and BEFORE anything is
+	// proposed. After auth, so an unauthenticated caller cannot consume a slot it
+	// was never entitled to; before proposing, so a shed request leaves no entry
+	// and is safe to retry.
+	release, rej, ok := c.admit.Admit(args.ClientID)
+	if !ok {
+		reply.Busy = true
+		reply.Err = rej.Reason
+		reply.RetryAfter = rej.RetryAfter
+		return nil
+	}
+	defer release()
+
 	cmd, err := toCommand(args)
 	if err != nil {
 		reply.Err = err.Error()
@@ -200,6 +292,21 @@ func (c *ClientService) Submit(args TxArgs, reply *TxReply) error {
 
 // Balance handles a read.
 func (c *ClientService) Balance(args BalanceArgs, reply *BalanceReply) error {
+	if !c.auth.check(args.Token) {
+		reply.Unauthenticated = true
+		reply.Err = ErrUnauthenticated
+		return nil
+	}
+
+	release, rej, ok := c.admit.Admit(args.ClientID)
+	if !ok {
+		reply.Busy = true
+		reply.Err = rej.Reason
+		reply.RetryAfter = rej.RetryAfter
+		return nil
+	}
+	defer release()
+
 	if !args.Linearizable {
 		// Stale-tolerant local read. Any node can serve it, including a follower
 		// that is behind. This is the read path LATER.md's follower reads build on.

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/homura/core-bank/hlc"
 	"github.com/homura/core-bank/ledger"
 )
 
@@ -24,6 +25,17 @@ var (
 	// timeout. The transaction is NOT resolved — it is blocked. This is 2PC's
 	// inherent blocking behavior, surfaced rather than papered over.
 	ErrInDoubt = errors.New("shard: transaction in doubt; awaiting coordinator recovery")
+
+	// ErrNotLeader means this node does not lead the shard that owns the account,
+	// so nothing was proposed. It is a TYPED error rather than a formatted string
+	// because the client API has to tell it apart from a genuine failure: §8
+	// requires answering with the leader's address so the client can retry there.
+	//
+	// Critically it must NOT be reported as Indeterminate. Indeterminate means
+	// "the entry may yet commit"; here no entry was ever created, and telling a
+	// client otherwise sends them retrying a write that never existed while
+	// treating the outcome as unknown.
+	ErrNotLeader = errors.New("shard: this node does not lead the shard owning that account")
 )
 
 // Group is one shard's Raft group, as the coordinator needs to see it.
@@ -44,6 +56,14 @@ type Coordinator struct {
 	ring   *Ring
 	groups map[ID]Group
 
+	// clock stamps commands with an HLC reading before they are appended.
+	//
+	// Assigned HERE, by the leader, before the entry reaches the log — never read
+	// during Apply. Reading the clock at apply time would make two replicas of one
+	// shard produce different state from the same log, which is the determinism
+	// rule DESIGN.md calls non-negotiable (learn/READING_LIST.md §19).
+	clock *hlc.Clock
+
 	// prepareTimeout bounds phase 1. A participant that does not vote in time is
 	// treated as a NO — the coordinator aborts rather than blocking forever.
 	prepareTimeout time.Duration
@@ -57,18 +77,56 @@ func NewCoordinator(ring *Ring, groups map[ID]Group) *Coordinator {
 	return &Coordinator{
 		ring:           ring,
 		groups:         groups,
+		clock:          hlc.New(),
 		prepareTimeout: 3 * time.Second,
 		commitTimeout:  3 * time.Second,
 	}
 }
+
+// Clock returns the coordinator's hybrid logical clock.
+//
+// Exposed so a process hosting several shards shares ONE clock across them.
+// Separate clocks per shard would still be causally correct, but they would drift
+// apart and make timestamps from the same machine incomparable for no reason.
+func (c *Coordinator) Clock() *hlc.Clock { return c.clock }
 
 // ShardFor returns the shard owning an account.
 func (c *Coordinator) ShardFor(account ledger.AccountID) ID {
 	return c.ring.Lookup(string(account))
 }
 
-// Transfer moves money between accounts, choosing single-shard or 2PC as needed.
+// Transfer applies a ledger command, choosing single-shard or 2PC as needed.
+//
+// Only a genuine two-account TRANSFER can span shards. Open, deposit, and
+// withdraw each touch exactly one account and are therefore always a single-group
+// commit — routing them by (From, To) sent them down the 2PC path, because the
+// unused side is the empty account id and hash("") lands on some arbitrary shard.
+// The result was a cross-shard 2PC between the real account and a shard that had
+// nothing to do with it, which aborted: every deposit and account-open through
+// this entry point failed.
+//
+// sim/ never caught this because its harness proposes single-account operations
+// straight to the owning group and only calls Transfer for real transfers. The
+// bug was reachable the moment a client API routed everything through here.
 func (c *Coordinator) Transfer(txID TxID, cmd ledger.Command) (ledger.Result, error) {
+	// Stamp before anything is proposed. Every replica then applies the SAME
+	// timestamp from the log, so the ordering is identical everywhere.
+	//
+	// A retry carries a fresh timestamp, which is correct: it is a new attempt at
+	// the same operation, and the idempotency fingerprint deliberately excludes
+	// the timestamp so the retry still returns the original result.
+	if cmd.Timestamp.IsZero() {
+		cmd.Timestamp = c.clock.Now()
+	}
+
+	// Route by the account the command actually touches.
+	switch cmd.Op {
+	case ledger.OpOpenAccount, ledger.OpDeposit:
+		return c.single(c.ShardFor(cmd.To), cmd)
+	case ledger.OpWithdraw:
+		return c.single(c.ShardFor(cmd.From), cmd)
+	}
+
 	fromShard := c.ShardFor(cmd.From)
 	toShard := c.ShardFor(cmd.To)
 
@@ -92,7 +150,7 @@ func (c *Coordinator) single(s ID, cmd ledger.Command) (ledger.Result, error) {
 		return ledger.Result{}, err
 	}
 	if !isLeader {
-		return ledger.Result{}, fmt.Errorf("shard: %s is not led by this node", s)
+		return ledger.Result{}, fmt.Errorf("%w (%s)", ErrNotLeader, s)
 	}
 	return res, nil
 }
@@ -128,11 +186,17 @@ func (c *Coordinator) twoPhase(txID TxID, cmd ledger.Command, fromShard, toShard
 		Op: OpPrepare, TxID: txID, Ledger: cmd,
 		Debit: true, Participants: participants, Coordinator: coordinator,
 	}, c.prepareTimeout)
-	if err != nil || !isLeader {
+	if !isLeader {
+		// This node does not lead the debit shard, so nothing was proposed anywhere
+		// and no participant is holding anything. Typed, so the client API can send
+		// the caller to the right node instead of reporting an unknown outcome.
+		return ledger.Result{}, fmt.Errorf("%w (debit shard %s)", ErrNotLeader, fromShard)
+	}
+	if err != nil {
 		// Could not even record our own vote: nothing was promised, so aborting is
 		// safe and no participant is left holding anything.
-		return ledger.Result{}, fmt.Errorf("shard: prepare failed on debit shard %s: %v (leader=%v)",
-			fromShard, err, isLeader)
+		return ledger.Result{}, fmt.Errorf("shard: prepare failed on debit shard %s: %w",
+			fromShard, err)
 	}
 	if !debitVote.OK {
 		// The debit side voted NO — insufficient funds, most commonly. Abort, and
@@ -149,10 +213,31 @@ func (c *Coordinator) twoPhase(txID TxID, cmd ledger.Command, fromShard, toShard
 		// The credit side did not vote yes. The debit side HAS reserved funds, so
 		// they must be released — this is exactly what the abort path exists for.
 		c.decide(txID, cmd, participants, coordinator, false, debitGroup, creditGroup)
-		if !creditVote.OK && creditVote.Err != "" {
+
+		// THREE distinct causes reach here, and they used to collapse into a bare
+		// ErrTxAborted with an empty Err. An abort with no reason is a real
+		// diagnostic gap: "transaction aborted (res={OK:false Err:})" tells an
+		// operator nothing about whether the customer had insufficient funds, the
+		// shard was unreachable, or this node simply does not lead it — three
+		// situations calling for three different responses.
+		switch {
+		case !creditVote.OK && creditVote.Err != "":
+			// The ledger refused it: insufficient funds, no such account. The most
+			// common case, and the one that already carried its reason.
 			return creditVote, ErrTxAborted
+		case !isLeader:
+			// This node does not lead the credit shard, so no vote was ever taken.
+			// Typed so the client API can redirect rather than reporting a failure.
+			return ledger.Result{Err: fmt.Sprintf(
+					"credit shard %s is not led by this node", toShard)},
+				fmt.Errorf("%w (credit shard %s)", ErrNotLeader, toShard)
+		case err != nil:
+			return ledger.Result{Err: err.Error()},
+				fmt.Errorf("%w: credit shard %s: %v", ErrTxAborted, toShard, err)
+		default:
+			return ledger.Result{Err: fmt.Sprintf(
+				"credit shard %s voted no without a reason", toShard)}, ErrTxAborted
 		}
-		return ledger.Result{}, ErrTxAborted
 	}
 
 	// ---- Phase 2: DECIDE and APPLY ----
@@ -205,6 +290,24 @@ func (c *Coordinator) decide(txID TxID, cmd ledger.Command, participants []ID,
 	return firstErr
 }
 
+// catchUp commits a no-op through the group and waits for it to apply, so the
+// caller can be sure the state machine reflects everything committed before now.
+//
+// Uses OpSingle with an empty ledger command, which the machine applies as a
+// harmless no-op: it moves no money and records no idempotency key. A dedicated
+// op code would be cleaner, but it would also be a wire-format change for a
+// purely local ordering guarantee.
+func (c *Coordinator) catchUp(g Group) error {
+	_, isLeader, err := g.Propose(Command{Op: OpSingle}, c.commitTimeout)
+	if err != nil {
+		return err
+	}
+	if !isLeader {
+		return ErrNotLeader
+	}
+	return nil
+}
+
 // RecoverInDoubt resolves transactions stuck in the prepared state.
 //
 // This is the answer to 2PC's blocking problem — not a way to avoid it, but the
@@ -221,6 +324,32 @@ func (c *Coordinator) RecoverInDoubt() (resolved int, err error) {
 	for shardID, g := range c.groups {
 		if !g.IsLeader() {
 			continue // only a leader may propose on behalf of its group
+		}
+
+		// Bring this leader fully up to date BEFORE scanning for in-doubt
+		// transactions.
+		//
+		// A freshly elected leader — especially one that has just restarted and is
+		// replaying its log — may not yet have APPLIED the prepare entries that put
+		// transactions in doubt. Scanning at that instant sees an empty in-doubt
+		// set and reports success, leaving real blocked transactions behind: a
+		// one-shot recovery that races the apply loop resolves whatever happens to
+		// be visible and silently skips the rest.
+		//
+		// Committing a no-op through this group and waiting for it to apply closes
+		// the race. It is the same §8 device the paper uses for a new leader's
+		// commit index, applied to the same problem: after our own entry applies,
+		// everything ordered before it has applied too, so the in-doubt set is
+		// complete rather than partial.
+		if err := c.catchUp(g); err != nil {
+			// Could not confirm this group is caught up, so any scan would be
+			// unreliable. Reported rather than guessed: skipping is safe (recovery
+			// is retried), inventing a result is not.
+			if firstErr == nil {
+				firstErr = fmt.Errorf("shard: %s not caught up for recovery: %w", shardID, err)
+			}
+			blocked++
+			continue
 		}
 
 		for _, txID := range g.Machine().InDoubt() {
