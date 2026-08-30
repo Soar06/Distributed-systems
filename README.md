@@ -29,7 +29,7 @@ imports.
 
 ```bash
 go build ./...
-go test -race ./...        # 117 tests
+go test -race ./...        # 286 tests
 ```
 
 ### Run a 3-node cluster
@@ -45,6 +45,57 @@ go run ./node -id n3 -listen 127.0.0.1:9003 -peers "$PEERS" -data ./data
 ```
 
 One node will log `Leader (term 1, ...)` within a few hundred milliseconds.
+
+### Run a sharded cluster
+
+`node` runs a single Raft group. `shardnode` hosts several shard replicas per
+process, multiplexed over one listener and one connection per peer:
+
+```bash
+go build -o shardnode ./cmd/shardnode
+
+PEERS="n1=127.0.0.1:9001,n2=127.0.0.1:9002,n3=127.0.0.1:9003"
+./shardnode -id n1 -listen 127.0.0.1:9001 -peers "$PEERS"             -shards shard-0,shard-1 -data ./data
+```
+
+With mutual TLS and client authentication (each node's certificate Common Name
+must be its node id — a valid certificate for the wrong node is still an
+impostor):
+
+```bash
+./shardnode ... -tls-cert n1.crt -tls-key n1.key -tls-ca ca.crt                 -client-token "$CORE_BANK_TOKEN"
+```
+
+Without those flags the node starts, but warns that both ports are
+unauthenticated plaintext.
+
+### Watch a cluster's health
+
+Pass `-obs-listen` to expose metrics and health on a separate port:
+
+```bash
+./shardnode ... -obs-listen 127.0.0.1:9101 -log-format json
+
+curl 127.0.0.1:9101/healthz   # is the PROCESS alive?
+curl 127.0.0.1:9101/readyz    # can this node COMMIT?
+curl 127.0.0.1:9101/metrics   # Prometheus text format
+curl 127.0.0.1:9101/status    # JSON, for the Phase 4 dashboard
+```
+
+The two health endpoints answer different questions, and the difference is the
+point. Kill enough peers to break quorum and the survivor reports:
+
+```
+$ curl -i 127.0.0.1:9101/readyz
+HTTP/1.1 503 Service Unavailable
+shard-0: NOT READY (leader has heard from 1 of 2 needed for quorum; cannot commit)
+
+$ curl -i 127.0.0.1:9101/healthz
+HTTP/1.1 200 OK
+```
+
+Alive, but unable to serve. Restarting it would destroy the cluster's remaining
+quorum; taking it out of rotation is the correct response.
 
 ### Move some money
 
@@ -68,6 +119,37 @@ Write to a follower and it will redirect you:
 ```
 ok=false err="raft: not leader" notLeader=true leaderAddr=127.0.0.1:9001
 ```
+
+### Watch it work
+
+The fastest way to see everything at once:
+
+```bash
+go run ./cmd/demo
+# bank app:  http://127.0.0.1:8080/bank-app/
+# dashboard: http://127.0.0.1:8080/cluster-dashboard/
+```
+
+One process runs a 3-shard cluster and serves both UIs. Open the dashboard
+beside the bank app and:
+
+- **Kill the leader** of a shard from the dashboard. Watch a survivor take over
+  in a new term while the shard keeps committing — then revive it and watch it
+  catch up.
+- **Kill two of three** and the shard reports `NOT READY` with the reason. That
+  is quorum, not a bug.
+- **Open two bank-app windows on one account** and withdraw from both at once.
+  The ledger serializes them: the balance never goes negative, and the loser
+  gets `insufficient funds`.
+- **Send twice** fires one idempotency key twice, concurrently. The money moves
+  once.
+
+State is pushed over Server-Sent Events at 100ms, which is fast enough to see a
+candidate mid-election rather than only the outcome.
+
+> The demo's control endpoints are **unauthenticated** — they kill nodes and
+> move money. It is a separate binary for that reason; never run it as a
+> production surface.
 
 ### Watch a failover
 
@@ -117,6 +199,7 @@ how a real transfer gets double-sent or wrongly reversed.
 | `NotLeader` + `LeaderAddr` | This node is not the leader. | Retry at `LeaderAddr`, same key. |
 | `Conflict` | The idempotency key was already used for a **different** request. | Do **not** retry unchanged. This is a bug in the caller. |
 | `Indeterminate` | **Outcome unknown.** The entry may still commit. | Retry with the **same** idempotency key. |
+| `Busy` | Shed by backpressure or a rate limit. **Nothing was proposed.** | Wait `RetryAfter`, then retry. Unambiguously safe. |
 
 `Indeterminate` is the one that matters. A timed-out write is *not* a failed
 write — the entry is in the leader's log and may commit a moment later. A client
@@ -139,6 +222,7 @@ balance.
 | `3` | not the leader — retry at the address printed |
 | `4` | **indeterminate** — retry with the same key |
 | `5` | idempotency key conflict — do not retry unchanged |
+| `6` | **busy** — shed by backpressure or a rate limit; nothing was proposed, so retry freely |
 
 Reads come in two flavours:
 
@@ -156,10 +240,15 @@ Reads come in two flavours:
 | `ledger/` | Accounts, double-entry, integer money, idempotency, fund reservation |
 | `shard/` | Consistent-hash ring, 2PC over Raft, coordinator and recovery |
 | `rpc/` | TCP transport, client API, peer-list parsing |
-| `node/` | The node binary — one process, one cluster node |
+| `node/` | The node binary — one process, one cluster node (single Raft group) |
+| `cmd/shardnode/` | The sharded node binary — one process hosting several shard replicas, multiplexed over one listener, with optional mutual TLS |
 | `cmd/bankcli/` | Minimal client for driving a cluster by hand |
+| `obs/` | Metrics, health/readiness endpoints, structured logging |
+| `hlc/` | Hybrid logical clocks — cross-shard event ordering |
+| `demo/` | Live cluster behind the web UI: SSE stream + fault-injection control |
 | `sim/` | Deterministic fault-injecting network and the chaos harness |
-| `fe/` | Phase 4 UI mockups — **not wired to the backend** |
+| `fe/` | The two UIs: a multi-window bank app and the cluster dashboard |
+| `cmd/demo/` | The demo binary — runs a cluster and serves both UIs |
 
 ## Documentation
 
@@ -179,7 +268,7 @@ shorter conference paper.
 ## Testing
 
 ```bash
-go test -race ./...              # everything, 117 tests
+go test -race ./...              # everything, 286 tests
 go test -race ./sim/             # chaos: crashes, partitions, loss, duplication
 go test -race -short ./...       # skips the long chaos and timing runs
 ```
@@ -193,7 +282,11 @@ says *something* broke, a Log Matching assertion says *what*.
 Measured results the tests produce:
 
 - Adding replicas does **not** add write throughput — 3 nodes 119.9 tx/s vs
-  5 nodes 105.9 tx/s. Sharding is what adds capacity.
+  5 nodes 105.9 tx/s. Sharding is what adds capacity, now measured directly:
+  with dedicated nodes per shard, 2 shards reach ~2.0x and 4 shards ~3.3-4.6x of
+  a single shard's write throughput.
+- Durability costs 25-50x in absolute throughput (fsync per persist), but
+  sharding still scales through it at ~2.2-2.8x across 4 shards.
 - Consistent hashing moves ~21.9% of keys when a 5th shard is added, against
   modulo's ~80%.
 - Virtual nodes cut shard skew from 579.88x to 1.17x.
@@ -203,27 +296,37 @@ Measured results the tests produce:
 ## Status
 
 **Phase 1 complete. Phase 2 core complete. A production-hardening pass has been
-run.** 117 tests pass under `-race`.
+run.** 286 tests pass under `-race`.
 
 Done: leader election, log replication, durable state, crash recovery,
 linearizable reads, double-entry ledger with idempotency, consistent-hash
 sharding, cross-shard 2PC modelled on Spanner with coordinator crash recovery and
-in-doubt resolution.
+in-doubt resolution. 2PC state is durable: a participant that voted YES keeps
+both its promise and the funds it reserved across a full-cluster restart, proven
+by four restart flows rather than asserted.
 
 **Not production-ready.** The significant remaining gaps, in risk order:
 
-1. **No authentication and no TLS.** Both the client and inter-node ports are
-   unauthenticated plaintext. Anyone who can reach them can read every balance
-   and inject `AppendEntries`.
-2. **No snapshotting or log compaction.** The state file is rewritten on every
-   persist — measured O(n²), 481x write amplification at 800 entries. This is a
-   hard scalability wall, not a slow degradation.
-3. **No multi-process sharded deployment.** `node/` runs a single Raft group;
-   sharding works only in-process today.
-4. **No metrics, health endpoints, or structured logging.** A cluster committing
-   against a degraded quorum looks identical to a healthy one from outside.
-5. **No cluster membership changes** — a failed node cannot be replaced without
-   full-cluster downtime.
+1. **Membership changes are not exposed on the wire.** `AddServer`/`RemoveServer`
+   work and are tested, but no admin RPC calls them, so a running cluster cannot
+   yet be reconfigured from outside.
 
-Phase 3 (hybrid logical clocks) and Phase 4 (the UIs) are not started; `fe/` is
-still static mockups on fake data.
+Everything else on the hardening list is now closed:
+
+- **Auth and TLS** — mutual TLS between nodes with the node id bound to the
+  certificate subject, plus client bearer tokens.
+- **Multi-process sharded deployment**, and the throughput benchmark it unblocked:
+  with dedicated nodes per shard, 4 shards reach ~3.3-4.6x a single shard's write
+  throughput.
+- **Snapshotting and log compaction** (§7) — persisted state drops 275x after
+  compacting 400 entries, and a lagging follower is caught up by `InstallSnapshot`.
+- **Metrics, health and readiness endpoints, structured logging** — `/readyz`
+  returns 503 with a reason when a node cannot commit, while `/healthz` still
+  returns 200.
+- **Cluster membership changes** — single-server add/remove, safe by the overlap
+  argument, with the cluster serving throughout.
+- **Backpressure, rate limiting, and graceful shutdown** — a shed request comes
+  back `Busy` rather than `Indeterminate`, so retrying is unambiguously safe.
+
+All four phases and the full hardening sequence are complete. `fe/` now drives
+a real cluster — see **Watch it work** above.
