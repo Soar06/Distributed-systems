@@ -23,6 +23,17 @@ type Transport interface {
 	SendRequestVote(to NodeID, args RequestVoteArgs) (RequestVoteReply, error)
 }
 
+// SnapshotTransport is an optional extension for §7's InstallSnapshot.
+//
+// Optional rather than part of Transport so that a transport predating
+// snapshotting still satisfies the base interface. A leader whose transport does
+// not implement it cannot catch up a follower that has fallen behind the
+// compacted prefix — it reports that plainly rather than pretending, because the
+// alternative is a follower that never converges and nobody notices.
+type SnapshotTransport interface {
+	SendInstallSnapshot(to NodeID, args InstallSnapshotArgs) (InstallSnapshotReply, error)
+}
+
 // Config holds the timing parameters that drive the role loop.
 //
 // §5.2 requires the timing inequality:
