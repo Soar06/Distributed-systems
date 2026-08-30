@@ -168,6 +168,9 @@ func (s *Server) startElection() {
 			continue
 		}
 		go func(peer NodeID) {
+			if s.transport == nil {
+				return // no transport configured; nothing to send
+			}
 			reply, err := s.transport.SendRequestVote(peer, args)
 			if err != nil {
 				return // unreachable peers simply do not vote
@@ -229,6 +232,15 @@ func (s *Server) becomeLeader(term Term) {
 	// A leader trivially matches its own log; this makes the commit-index
 	// majority count uniform over all peers.
 	s.matchIndex[s.id] = s.lastIndex()
+
+	// Contact history starts empty for a new term.
+	//
+	// Carrying it over would let a leader elected inside a minority partition
+	// report quorum from timestamps recorded BEFORE the partition — the readiness
+	// signal would then be a memory of a majority that no longer exists, which is
+	// precisely the blindness it exists to remove. Rebuilt from the first round of
+	// heartbeats, which follows immediately.
+	s.lastContact = make(map[NodeID]time.Time, len(s.peers))
 
 	// §8: "it needs to commit an entry from its term. Raft handles this by having
 	// each leader commit a blank no-op entry into the log at the start of its
@@ -295,6 +307,21 @@ func (s *Server) replicateTo(peer NodeID, term Term) {
 	if next < 1 {
 		next = 1
 	}
+
+	// The follower needs entries this leader has already discarded (§7). They
+	// cannot be sent as AppendEntries because they no longer exist, so the leader
+	// sends a snapshot instead.
+	//
+	// This branch is not merely an optimization: without it s.slot(next) computes a
+	// NEGATIVE slice index and the leader panics. A follower falling behind a
+	// compacted leader is routine — it restarts, or is briefly partitioned — so
+	// this crashed the leader on an ordinary event.
+	if next <= s.baseIndex() {
+		s.mu.Unlock()
+		s.sendSnapshotTo(peer, term)
+		return
+	}
+
 	prevIdx := next - 1
 	prevTerm, ok := s.termAt(prevIdx)
 	if !ok {
@@ -303,7 +330,7 @@ func (s *Server) replicateTo(peer NodeID, term Term) {
 
 	var entries []LogEntry
 	if s.lastIndex() >= next {
-		entries = append(entries, s.log[next:]...)
+		entries = append(entries, s.log[s.slot(next):]...)
 	}
 
 	args := AppendEntriesArgs{
@@ -316,6 +343,13 @@ func (s *Server) replicateTo(peer NodeID, term Term) {
 	}
 	s.mu.Unlock()
 
+	if s.transport == nil {
+		// NewServer explicitly permits a nil transport, for testing the RPC
+		// receiver rules in isolation. Dereferencing it here crashed the process
+		// rather than simply not replicating — a latent panic on a documented
+		// configuration.
+		return
+	}
 	reply, err := s.transport.SendAppendEntries(peer, args)
 	if err != nil {
 		return // unreachable; the next heartbeat retries
@@ -332,6 +366,28 @@ func (s *Server) replicateTo(peer NodeID, term Term) {
 	}
 	if s.role != Leader || s.currentTerm != term {
 		return // no longer the leader we were when this was sent
+	}
+
+	// Quorum contact is recorded only on SUCCESS.
+	//
+	// The tempting alternative — count any reply, on the grounds that a
+	// consistency-check failure is a healthy peer disagreeing about its log rather
+	// than an unreachable one — is wrong, and a test caught it. A STOPPED node also
+	// replies, with Success=false: raft.Server latches `stopped` and refuses to
+	// participate while its RPC handlers keep answering over the shared listener.
+	// Counting that as contact made a leader whose every peer had been shut down
+	// still report a full quorum, which is precisely the blindness readiness exists
+	// to remove.
+	//
+	// A peer that is genuinely repairing its log converges within a few rounds and
+	// then succeeds, so the cost of this stricter rule is a brief not-ready window
+	// during repair. That is the right trade: reporting NOT ready while repairing is
+	// conservative, reporting ready while isolated is dangerous.
+	if reply.Success {
+		if s.lastContact == nil {
+			s.lastContact = make(map[NodeID]time.Time)
+		}
+		s.lastContact[peer] = time.Now()
 	}
 
 	if reply.Success {
@@ -384,6 +440,11 @@ func (s *Server) advanceCommitIndexLocked() {
 		if count >= s.majority() {
 			s.commitIndex = n
 			s.applyCommitted()
+			// A leader that has just committed a configuration removing itself must
+			// step down — but only NOW, not when the entry was appended. It had to
+			// keep serving until the change committed, or it would have stranded the
+			// very entry that removes it (membership.go).
+			s.checkSelfRemovalLocked()
 			return
 		}
 	}

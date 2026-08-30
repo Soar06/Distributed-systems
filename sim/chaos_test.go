@@ -85,18 +85,20 @@ func TestReplicatesToAllFollowers(t *testing.T) {
 	c.Start()
 	defer c.Stop()
 
-	leader, ok := c.WaitForLeader(2 * time.Second)
-	if !ok {
+	if _, ok := c.WaitForLeader(2 * time.Second); !ok {
 		t.Fatal("no leader elected")
 	}
 
+	// Submitted through leadership changes: an election between finding the leader
+	// and submitting is legitimate Raft behaviour, and asserting it did not happen
+	// is asserting a property Raft does not offer.
 	for i := range 5 {
-		if _, _, ok := c.Nodes[leader].Submit([]byte(fmt.Sprintf("cmd%d", i))); !ok {
-			t.Fatalf("leader %s rejected a submit", leader)
+		if _, ok := c.SubmitWithRetry(t, []byte(fmt.Sprintf("cmd%d", i)), 5*time.Second); !ok {
+			t.Fatalf("could not submit cmd%d to any leader%s", i, c.View())
 		}
 	}
 
-	if !c.WaitForCommit(5, 2*time.Second) {
+	if !c.WaitForCommit(5, 5*time.Second) {
 		t.Fatalf("not all nodes applied 5 commands%s%s", c.View(), c.View().LogsString())
 	}
 	checkAll(t, c)
@@ -219,7 +221,7 @@ func TestChaosMonkey_CommittedEntriesSurviveLeaderCrash(t *testing.T) {
 		if id == old {
 			continue
 		}
-		applied := c.SMs[id].Snapshot()
+		applied := c.SMs[id].AppliedCopy()
 		if len(applied) < 4 {
 			t.Fatalf("%s lost committed entries: applied %v%s", id, applied, c.View())
 		}
@@ -265,7 +267,7 @@ func TestChaosGorilla_MinorityPartitionCannotCommit(t *testing.T) {
 			// A leader here would be a split brain unless it cannot commit.
 			if _, _, ok := s.Submit([]byte("split-brain")); ok {
 				time.Sleep(200 * time.Millisecond)
-				if s.CommitIndex() > 0 && len(c.SMs[id].Snapshot()) > 0 {
+				if s.CommitIndex() > 0 && len(c.SMs[id].AppliedCopy()) > 0 {
 					t.Fatalf("minority node %s committed an entry: split brain%s%s",
 						id, c.View(), c.View().LogsString())
 				}
@@ -416,7 +418,7 @@ func TestLatencyMonkey_DuplicatedRPCsDoNotDoubleApply(t *testing.T) {
 
 	// Each command must appear exactly once on every node.
 	for _, id := range c.IDs {
-		applied := c.SMs[id].Snapshot()
+		applied := c.SMs[id].AppliedCopy()
 		counts := make(map[string]int)
 		for _, cmd := range applied {
 			counts[cmd]++

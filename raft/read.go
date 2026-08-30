@@ -87,6 +87,9 @@ func (s *Server) ReadIndex(timeout time.Duration) (Index, error) {
 			commit := s.commitIndex
 			s.mu.Unlock()
 
+			if s.transport == nil {
+				return
+			}
 			reply, err := s.transport.SendAppendEntries(peer, AppendEntriesArgs{
 				Term:         term,
 				LeaderID:     me,
