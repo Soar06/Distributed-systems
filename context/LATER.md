@@ -62,12 +62,50 @@ Build target: add rate limiting + backpressure at the RPC layer, and a
 demonstration of leader saturation under write load that more replicas don't fix
 (only sharding does).
 
-## Other production-shape items to fold in later
+## Other production-shape items
 
-- Service discovery instead of a static peer list (e.g. so nodes can join/leave
-  without a config change).
-- TLS between nodes and between client/node.
-- Snapshotting + log compaction for long-running logs (needed once the log gets
-  large enough that replaying it from scratch is impractical).
-- Observability: metrics/tracing per node (who's leader, replication lag, commit
-  latency) — the operational analog of the demo UI in NOW.md Phase 4.
+### Done — moved out of LATER and into the system
+
+These were on this list and have since been built. Kept here, marked, rather than
+deleted: a list that only ever grows tells you nothing about progress, and a list
+that quietly drops items loses the record of what was once considered future work.
+
+- **TLS between nodes and between client/node** — mutual TLS with the node id
+  bound to the certificate subject, plus client bearer tokens (`rpc/security.go`,
+  READING_LIST §13). Verification alone proves only that a peer holds a
+  cert signed by our CA, which every node does; binding the connection to the
+  id we meant to dial is what stops one member impersonating another.
+- **Snapshotting + log compaction** — `raft/snapshot.go`, `rpc/snapshot_rpc.go`,
+  §7. Measured 275x log reduction.
+- **Observability** — `obs/`, plus `raft.Health` for readiness vs liveness
+  (READING_LIST §16). Hand-written Prometheus text format, no dependency.
+- **Backpressure and load shedding** — `rpc/admission.go`, `rpc/drain.go`
+  (READING_LIST §18). This was the theory-relevant half of the autoscaling item
+  below.
+- **Membership changes over the wire** — `rpc/admin.go`. Not originally on this
+  list; it was the README's top open gap and is now closed, which also makes
+  *service discovery* below a smaller job than it was.
+- **Durable demo state** — `-data` on `cmd/demo` gives every replica its own WAL,
+  so the UI cluster survives a restart rather than being pure RAM.
+
+### Still open
+
+- **Service discovery** instead of a static peer list, so nodes can join or leave
+  without a config change. Now that membership is exposed over the wire
+  (`rpc/admin.go`), this is the remaining half: something has to *decide* to call
+  AddServer/RemoveServer, and to tell a new node who its peers are.
+- **Follower reads** — the read path exists (`ReadIndex`, `LinearizableRead`) but
+  every read still goes through the leader. READING_LIST §22 records the design
+  decision and the condition on adding this: it must be opt-in per request with
+  the weaker guarantee stated in the response, never a silent downgrade of every
+  read. A stale balance is a wrong balance.
+- **Region-labelled shards** — no notion of region exists anywhere in `shard/` or
+  `sim/` yet. Prerequisite for the geographic sharding section above.
+- **Live resharding** — the demo's `Resize` rebuilds the cluster from scratch,
+  which is honest for a teaching control but is not resharding. Moving key ranges
+  between shards while serving traffic is a genuinely harder problem.
+- **Autoscaling replica count** — deliberately still here and deliberately still
+  ops rather than theory. Worth keeping written down because it is the field's
+  most common misconception: adding replicas to a Raft group does not add write
+  throughput. Writes still funnel through one leader. More replicas buy fault
+  tolerance and read capacity; only more *shards* buy write throughput.
