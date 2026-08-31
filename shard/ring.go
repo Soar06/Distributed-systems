@@ -73,6 +73,46 @@ func hashKey(s string) uint32 {
 	return crc32.ChecksumIEEE([]byte(s))
 }
 
+// Segment is one arc of the ring: the span [Start, End) owned by one shard.
+//
+// Exposed for visualization. The ring's real structure is VIRTUAL NODES — each
+// shard placed at many points — and a view that only plots a few account keys
+// shows where those keys happen to land while hiding the ownership structure
+// that actually decides placement.
+type Segment struct {
+	Start uint32
+	End   uint32
+	Shard ID
+}
+
+// Segments returns the ring's ownership arcs, in ring order.
+//
+// Each arc runs from one virtual node to the next, and belongs to the shard at
+// its END: a key is owned by the first shard clockwise from its hash, so the arc
+// leading up to a virtual node is that node's territory.
+func (r *Ring) Segments() []Segment {
+	if len(r.points) == 0 {
+		return nil
+	}
+
+	out := make([]Segment, 0, len(r.points))
+	for i, p := range r.points {
+		// The arc preceding this point. The first wraps around from the last, which
+		// is what makes it a ring rather than a line.
+		var start uint32
+		if i == 0 {
+			start = r.points[len(r.points)-1].hash
+		} else {
+			start = r.points[i-1].hash
+		}
+		out = append(out, Segment{Start: start, End: p.hash, Shard: p.shard})
+	}
+	return out
+}
+
+// VNodes reports how many virtual points each shard occupies.
+func (r *Ring) VNodes() int { return r.vnodes }
+
 // HashKey exposes a key's position on the ring, for visualization.
 //
 // Exported so the dashboard draws the REAL placement rather than a decorative

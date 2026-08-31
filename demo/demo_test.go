@@ -26,9 +26,11 @@ import (
 // node is reported down and its shard fails over), concurrent (two clients on one
 // account), and retry (the same idempotency key twice moves money once).
 
+// newTestCluster builds a cluster where every machine holds every shard, which
+// is the RF == machine-count case most of these tests assume.
 func newTestCluster(t *testing.T, shards, replicas int) *Cluster {
 	t.Helper()
-	c, err := New(shards, replicas, 91)
+	c, err := New(shards, replicas, replicas, 91)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

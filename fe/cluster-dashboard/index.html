@@ -2,334 +2,1302 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Core Bank — Cluster Dashboard</title>
+<title>Core Bank — CAP &amp; Replication</title>
 <style>
   :root {
     --bg: #0f1115; --panel: #171a21; --line: #262b36; --card: #1d212b;
     --text: #e5e7eb; --dim: #9ca3af; --faint: #6b7280;
     --green: #4ade80; --blue: #60a5fa; --amber: #facc15; --red: #f87171;
+    --hl: #f472b6;
   }
   * { box-sizing: border-box; }
   body {
     font-family: system-ui, -apple-system, sans-serif;
-    background: var(--bg); color: var(--text); margin: 0; padding: 18px;
+    background: var(--bg); color: var(--text); margin: 0; padding: 16px 18px 40px;
   }
-  h1 { font-size: 18px; margin: 0 0 2px; }
-  .sub { font-size: 12px; color: var(--dim); margin-bottom: 16px; }
-  .sub code { background: #1f2430; padding: 1px 5px; border-radius: 3px; }
+  code { background: #1f2430; padding: 1px 5px; border-radius: 3px; font-size: 11px; }
+  h1 { font-size: 17px; margin: 0 0 3px; }
+  .lede { font-size: 12px; color: var(--dim); margin-bottom: 14px; }
 
-  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .tabs { display: flex; gap: 8px; margin-bottom: 14px; }
+  .tab {
+    flex: 1; text-align: left; padding: 11px 13px; border-radius: 9px;
+    border: 1px solid var(--line); background: var(--panel);
+    cursor: pointer; transition: border-color .12s, background .12s;
+  }
+  .tab:hover { border-color: #4b5563; }
+  .tab.on { border-color: var(--blue); background: #1e3a8a26; }
+  .tab .t { font-size: 13px; font-weight: 700; margin-bottom: 2px; }
+  .tab.on .t { color: var(--blue); }
+  .tab .d { font-size: 11px; color: var(--faint); line-height: 1.45; }
+
   .panel {
     background: var(--panel); border: 1px solid var(--line);
-    border-radius: 10px; padding: 14px;
+    border-radius: 10px; padding: 14px; margin-bottom: 14px;
   }
   .panel h2 {
-    font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em;
-    color: var(--dim); margin: 0 0 12px; display: flex;
-    justify-content: space-between; align-items: center;
+    font-size: 11px; text-transform: uppercase; letter-spacing: .06em;
+    color: var(--dim); margin: 0 0 11px;
   }
-  .wide { grid-column: 1 / span 2; }
+  .hint { font-size: 11px; color: var(--faint); line-height: 1.6; margin-top: 10px; }
 
-  /* connection + health banner */
-  .banner {
-    display: flex; gap: 14px; align-items: center; font-size: 12px;
-    margin-bottom: 14px; padding: 8px 12px; border-radius: 8px;
+  .bar {
+    display: flex; gap: 16px; align-items: center; font-size: 12px;
+    padding: 8px 12px; border-radius: 8px; margin-bottom: 14px;
     background: var(--panel); border: 1px solid var(--line);
   }
   .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
-  .dot.up { background: var(--green); }
-  .dot.down { background: var(--red); }
-  .banner .money { margin-left: auto; color: var(--dim); }
-  .banner .money b { color: var(--text); }
+  .dot.up { background: var(--green); } .dot.down { background: var(--red); }
+  .bar .right { margin-left: auto; color: var(--dim); }
+  .bar b { font-variant-numeric: tabular-nums; color: var(--text); }
 
-  /* shards */
-  .shard {
-    border: 1px solid var(--line); border-radius: 8px;
-    padding: 10px; margin-bottom: 10px; background: #14171e;
+  /* CAP */
+  .shard-cap {
+    border: 1px solid var(--line); border-radius: 9px; padding: 12px;
+    margin-bottom: 10px; background: #14171e;
   }
-  .shard-head {
-    display: flex; align-items: center; gap: 8px;
-    font-size: 13px; font-weight: 600; margin-bottom: 8px;
+  .shard-cap.degraded { border-color: #a16207; }
+  .shard-cap.broken { border-color: #7f1d1d; }
+  .cap-head { display: flex; align-items: center; gap: 10px; margin-bottom: 9px; flex-wrap: wrap; }
+  .cap-head .nm { font-size: 13px; font-weight: 700; }
+  .cap-head .accts { font-size: 11px; color: var(--faint); }
+  .cap-head .quorum {
+    margin-left: auto; font-size: 11px; color: var(--dim);
+    font-variant-numeric: tabular-nums;
   }
-  .shard-head .meta { margin-left: auto; font-size: 11px; color: var(--faint); font-weight: 400; }
-  .badge {
-    font-size: 10px; padding: 2px 6px; border-radius: 4px; font-weight: 600;
-  }
-  .badge.ready { background: #16a34a26; color: var(--green); }
-  .badge.notready { background: #dc262626; color: var(--red); }
-  .badge.indoubt { background: #ca8a0426; color: var(--amber); }
+  .verdict { display: flex; gap: 8px; }
+  .v { flex: 1; border-radius: 7px; padding: 8px 10px; font-size: 11px; border: 1px solid; }
+  .v .k { font-weight: 700; font-size: 11.5px; margin-bottom: 2px; }
+  .v .why { color: var(--faint); font-weight: 400; margin-top: 2px; line-height: 1.4; }
+  .v.yes { border-color: #15803d; background: #14532d33; color: var(--green); }
+  .v.no { border-color: #b91c1c; background: #7f1d1d33; color: var(--red); }
+  .v.stale { border-color: #a16207; background: #78350f33; color: var(--amber); }
 
-  .nodes { display: flex; gap: 8px; flex-wrap: wrap; }
-  .node {
-    flex: 1; min-width: 150px; border-radius: 7px; padding: 9px;
-    border: 1px solid #2a2f3a; background: var(--card);
-    transition: border-color .15s, opacity .15s;
+  /* machines */
+  .machines { display: flex; gap: 10px; }
+  .machine {
+    flex: 1; border: 1px solid #2a2f3a; background: var(--card);
+    border-radius: 9px; padding: 11px;
   }
-  .node.down { opacity: .45; border-color: #7f1d1d; }
-  .node.lagging { border-color: #a16207; }
-  .node .name { font-size: 12px; font-weight: 600; margin-bottom: 5px; }
-  .role {
-    display: inline-block; font-size: 10px; padding: 2px 6px;
-    border-radius: 4px; margin-bottom: 6px; font-weight: 600;
+  .machine.down { opacity: .5; border-color: #7f1d1d; }
+  .machine .mn { font-size: 13px; font-weight: 700; margin-bottom: 2px; }
+  .machine .ml { font-size: 10.5px; color: var(--faint); margin-bottom: 8px; min-height: 14px; }
+  .machine button.killbtn {
+    width: 100%; padding: 10px; font-size: 11.5px; font-weight: 700;
+    letter-spacing: .04em; border-radius: 6px; cursor: pointer; border: 1px solid;
   }
+  .machine .killbtn.kill { border-color: #b91c1c; background: #7f1d1d55; color: #fca5a5; }
+  .machine .killbtn.kill:hover { background: #7f1d1d99; }
+  .machine .killbtn.revive { border-color: #15803d; background: #14532d55; color: #86efac; }
+  .machine .killbtn.revive:hover { background: #14532d99; }
+  .machine .killbtn:disabled { opacity: .45; cursor: wait; }
+
+  .reps { display: flex; flex-direction: column; gap: 5px; margin-bottom: 9px; }
+  .rp {
+    display: flex; align-items: center; gap: 6px; font-size: 10.5px;
+    padding: 4px 6px; border-radius: 5px; background: #12151c; border: 1px solid #2f3542;
+  }
+  .rp .s { font-weight: 600; }
+  .rp .ix { margin-left: auto; color: var(--faint); font-variant-numeric: tabular-nums; }
+  .role { font-size: 9px; padding: 1px 5px; border-radius: 3px; font-weight: 700; }
   .role.Leader { background: #16a34a33; color: var(--green); }
   .role.Follower { background: #2563eb33; color: var(--blue); }
   .role.Candidate { background: #ca8a0433; color: var(--amber); }
   .role.Down { background: #dc262633; color: var(--red); }
-  .node .stats { font-size: 10px; color: var(--faint); line-height: 1.5; font-variant-numeric: tabular-nums; }
-  .node .lag { color: var(--amber); }
-  .node button {
-    width: 100%; margin-top: 7px; font-size: 10px; padding: 4px;
-    border-radius: 4px; border: 1px solid #3a4150; background: #232834;
-    color: var(--text); cursor: pointer;
-  }
-  .node button:hover { background: #2c323f; }
-  .node button.revive { border-color: #15803d; color: var(--green); }
 
-  /* ring */
-  .ring-wrap { display: flex; justify-content: center; }
-  .ring-label { font-size: 9px; fill: var(--dim); }
-
-  /* tables + log */
-  table { width: 100%; border-collapse: collapse; font-size: 11px; }
-  th {
-    text-align: left; color: var(--faint); font-weight: 500;
-    padding: 4px 6px; border-bottom: 1px solid var(--line);
+  /* replication */
+  .picker { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 12px; }
+  .chip {
+    font-size: 11px; padding: 6px 12px; border-radius: 999px; cursor: pointer;
+    border: 1px solid #2f3542; background: #12151c; color: var(--dim);
   }
-  td { padding: 4px 6px; border-bottom: 1px solid #1e222b; font-variant-numeric: tabular-nums; }
-  td.num { text-align: right; }
-  .reserved { color: var(--amber); font-size: 10px; }
+  .chip:hover { border-color: #4b5563; color: var(--text); }
+  .chip.on { border-color: var(--hl); background: #f472b62e; color: #fbcfe8; font-weight: 700; }
+
+  .logcols { display: grid; gap: 10px; }
+  .logcol { border: 1px solid var(--line); border-radius: 8px; padding: 10px; background: #14171e; }
+  .logcol.down { opacity: .5; border-color: #7f1d1d; }
+  .logcol h3 { font-size: 12px; margin: 0 0 7px; display: flex; gap: 7px; align-items: center; }
+  .logcol h3 .ix { margin-left: auto; font-size: 10px; color: var(--faint); font-weight: 400; }
+  .entry {
+    font-family: ui-monospace, Menlo, Consolas, monospace;
+    font-size: 10.5px; padding: 4px 7px; border-radius: 4px; margin-bottom: 3px;
+    border-left: 3px solid #374151; background: #101319; color: var(--faint);
+  }
+  .entry.committed { border-left-color: var(--blue); color: var(--dim); }
+  .entry.applied { border-left-color: var(--green); color: var(--text); }
+  .entry .i { color: var(--faint); }
+
+  .legend { display: flex; gap: 14px; font-size: 10.5px; color: var(--faint); margin-top: 8px; flex-wrap: wrap; }
+  .legend span::before {
+    content: ''; display: inline-block; width: 9px; height: 3px;
+    margin-right: 5px; vertical-align: middle; border-radius: 2px;
+  }
+  .legend .l1::before { background: #374151; }
+  .legend .l2::before { background: var(--blue); }
+  .legend .l3::before { background: var(--green); }
+
+  .try {
+    display: flex; gap: 8px; flex-wrap: wrap; align-items: center;
+    padding: 10px 12px; border-radius: 8px; margin-bottom: 12px;
+    border: 1px solid #1e3a8a; background: #1e3a8a14; font-size: 11.5px;
+  }
+  .try b { color: var(--blue); }
+  .try button {
+    padding: 7px 13px; font-size: 11px; border-radius: 6px; cursor: pointer;
+    border: 1px solid #3a4150; background: #232834; color: var(--text); font-weight: 600;
+  }
+  .try button:hover { background: #2c323f; }
 
   .log {
     font-family: ui-monospace, Menlo, Consolas, monospace;
-    font-size: 11px; line-height: 1.6; max-height: 260px; overflow-y: auto;
+    font-size: 11px; line-height: 1.6; max-height: 180px; overflow-y: auto;
     background: #101319; border: 1px solid var(--line); border-radius: 6px; padding: 8px;
   }
   .log div { white-space: pre-wrap; color: var(--dim); }
-  .log div.hot { color: var(--text); }
   .log div.bad { color: var(--red); }
   .log div.warn { color: var(--amber); }
+  .log div.hot { color: var(--text); }
 
-  .hint { font-size: 11px; color: var(--faint); margin-top: 8px; line-height: 1.5; }
+  .ctlrow {
+    display: flex; gap: 12px; align-items: center; flex-wrap: wrap;
+    margin-bottom: 9px; font-size: 11.5px; color: var(--dim);
+  }
+  .ctlrow label { display: flex; gap: 6px; align-items: center; }
+  .ctlrow input {
+    background: #12151c; border: 1px solid #2f3542; color: var(--text);
+    border-radius: 5px; padding: 5px 7px; font-size: 12px; width: 74px;
+  }
+  .ctlrow input[type=text] { width: 110px; }
+  .ctlrow button {
+    padding: 6px 13px; font-size: 11px; font-weight: 600; border-radius: 6px;
+    cursor: pointer; border: 1px solid #1d4ed8; background: #1e3a8a55; color: var(--blue);
+  }
+  .ctlrow button:hover { background: #1e3a8a99; }
+  .ctlrow button:disabled { opacity: .5; cursor: wait; }
+
+  .ring-wrap { flex: 0 0 auto; }
+  #ring text { font-size: 10px; }
+  #ring g.clickable { cursor: pointer; }
+
+  .circles { display: flex; gap: 10px; align-items: flex-start; justify-content: center; }
+  .circle-box { flex: 1; max-width: 340px; text-align: center; }
+  .circle-title {
+    font-size: 11px; font-weight: 700; letter-spacing: .05em; color: var(--blue);
+    margin-bottom: 4px;
+  }
+  .circle-title span { color: var(--faint); font-weight: 400; letter-spacing: 0; }
+  .circle-note {
+    font-size: 10.5px; color: var(--faint); line-height: 1.55; text-align: left;
+    margin-top: 6px;
+  }
+  .arrow-between {
+    align-self: center; font-size: 26px; color: var(--faint); padding: 0 4px;
+    transition: color .15s;
+  }
+  .arrow-between.on { color: var(--hl); }
+  #ringA text, #ringB text { font-size: 10px; }
+  #ringA g.clickable, #ringB g.clickable { cursor: pointer; }
+
+  .trace {
+    border: 1px solid var(--hl); background: #f472b614; border-radius: 8px;
+    padding: 10px 12px; margin-top: 12px; font-size: 11.5px; line-height: 1.7;
+    color: var(--dim);
+  }
+  .trace b { color: #fbcfe8; }
+  .trace .step { display: inline-block; margin-right: 6px; color: var(--faint); }
+
+  .evfilters select {
+    background: #12151c; color: var(--text); border: 1px solid #2f3542;
+    border-radius: 5px; padding: 3px 5px; font-size: 11px;
+  }
+  .evrow { display: flex; gap: 7px; align-items: baseline; padding: 1px 0; }
+  .evkind {
+    flex: 0 0 52px; font-size: 9px; text-transform: uppercase; letter-spacing: .05em;
+    text-align: center; border-radius: 3px; padding: 1px 0; font-weight: 700;
+  }
+  .evkind.client  { background: #1e3a8a55; color: #93c5fd; }
+  .evkind.raft    { background: #14532d55; color: #86efac; }
+  .evkind.control { background: #78350f55; color: #fcd34d; }
+  .evat { flex: 0 0 76px; color: #4b5563; }
+  .evtext { flex: 1; }
+
+  .lchart { display: flex; flex-direction: column; gap: 9px; }
+  .lrow { border: 1px solid #262b36; border-radius: 7px; padding: 8px 10px; background: #12151c; }
+  .lhead { display: flex; justify-content: space-between; margin-bottom: 6px; }
+  .lname { font-weight: 700; }
+  .lterm { color: var(--faint); }
+  .lnodes { display: flex; gap: 6px; flex-wrap: wrap; }
+  .lnode {
+    border: 1px solid #2f3542; border-radius: 5px; padding: 3px 8px; font-size: 11px;
+    background: #0d1016;
+  }
+  .lnode.leader { border-color: var(--green); background: #14532d55; color: #86efac; font-weight: 700; }
+  .lnode.follower { color: #9ca3af; }
+  .lnode.down { border-color: #7f1d1d; background: #7f1d1d33; color: #fca5a5; text-decoration: line-through; }
+  .lnode.lag { border-color: var(--amber); color: var(--amber); }
+  .lnone { color: var(--red); font-weight: 700; }
+
+  .ndcard { border: 1px solid #262b36; border-radius: 7px; padding: 9px 11px; background: #12151c; margin-bottom: 8px; }
+  .ndhead { display: flex; justify-content: space-between; margin-bottom: 6px; font-weight: 700; }
+  .ndtable { width: 100%; border-collapse: collapse; font-size: 11px; }
+  .ndtable th { text-align: left; color: var(--faint); font-weight: 600; padding: 2px 6px 4px 0; }
+  .ndtable td { padding: 2px 6px 2px 0; font-variant-numeric: tabular-nums; }
+  .ndrole.Leader { color: #86efac; font-weight: 700; }
+  .ndrole.Follower { color: #9ca3af; }
+  .ndrole.Candidate { color: var(--amber); }
+  .ndrole.Down { color: #fca5a5; }
+  .ndempty { color: var(--faint); font-style: italic; }
+
+  #btnResize.armed {
+    border-color: var(--amber); background: #78350f55; color: var(--amber);
+    font-weight: 700;
+  }
+
+  .hbar { display: flex; gap: 3px; margin: 7px 0 4px; }
+  .hseg {
+    flex: 1; height: 6px; border-radius: 2px; background: #2a2f3a;
+    transition: background .2s;
+  }
+  .hbar.low .hseg:nth-child(1) { background: var(--red); }
+  .hbar.normal .hseg:nth-child(1),
+  .hbar.normal .hseg:nth-child(2) { background: var(--amber); }
+  .hbar.high .hseg { background: var(--green); }
+
+  .hrow { display: flex; gap: 4px; align-items: center; margin-bottom: 8px; }
+  .hpick {
+    flex: 1; font-size: 9.5px; padding: 3px 0; border-radius: 4px; cursor: pointer;
+    border: 1px solid #2f3542; background: #12151c; color: var(--faint);
+    font-weight: 600; letter-spacing: .03em;
+  }
+  .hpick:hover { border-color: #4b5563; color: var(--text); }
+  .hpick.on.low { border-color: #b91c1c; background: #7f1d1d44; color: #fca5a5; }
+  .hpick.on.normal { border-color: #a16207; background: #78350f44; color: var(--amber); }
+  .hpick.on.high { border-color: #15803d; background: #14532d44; color: #86efac; }
+  .hlock {
+    font-size: 9.5px; padding: 3px 6px; border-radius: 4px; cursor: pointer;
+    border: 1px solid #2f3542; background: #12151c; color: var(--faint);
+  }
+  .hlock.on { border-color: var(--hl); background: #f472b62e; color: #fbcfe8; }
+
+  .hidden { display: none; }
 </style>
 </head>
 <body>
 
-<h1>Cluster Dashboard</h1>
-<div class="sub">
-  Live state from a real cluster over <code>/api/stream</code> (Server-Sent Events).
-  Kill a node and watch the failover — nothing here is mocked.
+<h1>Core Bank — a CP distributed ledger</h1>
+<div class="lede">One bank, <span id="topo">…</span>. Two things worth understanding, one tab each.</div>
+
+<div class="tabs">
+  <div class="tab on" id="tabCap"><div class="t">1 · The CAP choice</div>
+    <div class="d">Kill machines until a shard loses its majority. Watch it <b>refuse
+    writes</b> rather than accept one it cannot prove — while reads still answer,
+    marked stale.</div></div>
+  <div class="tab" id="tabRep"><div class="t">2 · How Raft replicates</div>
+    <div class="d">What gets copied is the <b>log</b>, not the balance. Watch an entry
+    appear on the leader, commit at a majority, then apply.</div></div>
 </div>
 
-<div class="banner">
+<div class="bar">
   <span><span class="dot down" id="connDot"></span> <span id="connText">connecting…</span></span>
-  <span id="clockText" style="color:var(--faint)"></span>
-  <span class="money">total money <b id="totalMoney">—</b></span>
+  <span class="right">total <b id="total">—</b></span>
 </div>
 
-<div class="grid">
+<div class="panel" id="builder">
+  <h2>Build the cluster</h2>
+  <div class="ctlrow">
+    <label>shards <input id="inShards" type="number" min="1" max="12" value="3"></label>
+    <label>machines <input id="inNodes" type="number" min="1" max="12" value="3"></label>
+    <label>replication factor <input id="inRF" type="number" min="1" max="7" value="3"></label>
+    <button id="btnResize">rebuild cluster</button>
+    <span id="resizeMsg" style="color:var(--faint)"></span>
+  </div>
+  <div class="ctlrow">
+    <label>new account <input id="inAcct" type="text" placeholder="name" size="10"></label>
+    <label>opening balance <input id="inAmt" type="number" value="10000" size="8"></label>
+    <button id="btnAdd">add account</button>
+    <span id="addMsg" style="color:var(--faint)"></span>
+  </div>
+  <div class="hint">
+    <b>Replication factor stays fixed as machines grow.</b> Putting every shard on
+    every machine would make a 9-machine cluster need a quorum of 5 — adding
+    hardware would make writes slower and <i>less</i> available. With RF=3 and 9
+    machines, most machines hold only some shards, so some hold no copy of a given
+    account at all.
+    <br>
+    Rebuilding is a teaching control: a live cluster would migrate replicas
+    (resharding, deliberately out of scope). Accounts are replayed at their opening
+    balance.
+  </div>
+</div>
 
-  <div class="panel wide">
-    <h2>Shards &amp; Nodes <span id="shardCount" style="color:var(--faint);font-weight:400"></span></h2>
-    <div id="shards"></div>
-    <div class="hint">
-      Killing a node crashes its network link. With 3 replicas a shard survives one
-      loss; kill two and the shard stops committing — that is quorum, not a bug.
+<div class="panel" id="ringPanel">
+  <h2>Where does an account's money live? Two separate decisions</h2>
+
+  <div class="circles">
+    <div class="circle-box">
+      <div class="circle-title">1 &middot; HASH RING <span>account &rarr; shard</span></div>
+      <svg id="ringA" width="300" height="300" viewBox="0 0 300 300"></svg>
+      <div class="circle-note">
+        <code>crc32(name)</code> gives an angle; the first shard clockwise owns it.
+        Pure maths, so every machine agrees without asking anyone. Each shard sits at
+        <span id="vnodeCount">150</span> virtual points, which is what makes the
+        split near-even instead of a few lopsided blocks.
+      </div>
+    </div>
+
+    <div class="arrow-between" id="arrowMid">&rarr;</div>
+
+    <div class="circle-box">
+      <div class="circle-title">2 &middot; PLACEMENT <span>shard &rarr; machines</span></div>
+      <svg id="ringB" width="300" height="300" viewBox="0 0 300 300"></svg>
+      <div class="circle-note">
+        <b>Not hashing</b> &mdash; a lookup rule: <code>(shard + k) mod nodes</code>.
+        With few shards a table is cheap, and real systems keep one so placement can
+        react to disk space and rack topology, which a hash cannot know.
+      </div>
     </div>
   </div>
 
+  <div id="pathTrace"></div>
+</div>
+
+<div id="storyCap">
+  <div class="try">
+    <b>Try it:</b><span>kill machines below, then</span>
+    <button id="btnWrite">attempt a write</button>
+    <span id="tryResult" style="color:var(--faint)"></span>
+  </div>
   <div class="panel">
-    <h2>Hash Ring</h2>
-    <div class="ring-wrap"><svg id="ring" width="300" height="300" viewBox="0 0 300 300"></svg></div>
+    <h2>Each shard's CAP verdict</h2>
+    <div id="capShards"></div>
     <div class="hint">
-      Real placement: each dot sits at <code>crc32(account)</code> on the 2^32 ring
-      and is owned by the first shard clockwise.
+      A shard commits only when a <b>majority</b> of its machines agree. Below that
+      it faces the CAP choice: accept a write no majority has seen (<b>AP</b> — and
+      risk two machines accepting conflicting withdrawals of the same money), or
+      refuse (<b>CP</b>). This system chooses CP: it would rather tell you it cannot
+      serve than tell you something false about your money.
     </div>
   </div>
-
   <div class="panel">
-    <h2>Recent Transactions</h2>
-    <div id="txs" class="log" style="max-height:300px"></div>
+    <h2>Machines</h2>
+    <div class="machines" id="capMachines"></div>
     <div class="hint">
-      The HLC timestamp is what orders these ACROSS shards — per-shard
-      <code>Seq</code> numbers are unrelated between shards.
+      Every machine hosts a replica of <b>every</b> shard, so killing one costs each
+      shard a replica at once. 3 machines → majority is 2: survive one loss, refuse
+      writes after two, go dark after three.
     </div>
   </div>
+</div>
 
-  <div class="panel wide">
-    <h2>Cluster Events</h2>
-    <div id="events" class="log"></div>
+<div id="storyRep" class="hidden">
+  <div class="try">
+    <b>Try it:</b><span>pick a shard, then</span>
+    <button id="btnDeposit">deposit into it</button>
+    <span>and watch the entry land on the leader first.</span>
+    <span id="repResult" style="color:var(--faint)"></span>
   </div>
+  <div class="panel">
+    <h2>Which shard's log</h2>
+    <div class="picker" id="shardPicker"></div>
+    <div class="logcols" id="logCols"></div>
+    <div class="legend">
+      <span class="l1">on this machine, not yet committed</span>
+      <span class="l2">committed — a majority stored it</span>
+      <span class="l3">applied — folded into the balance</span>
+    </div>
+    <div class="hint">
+      Every machine holds the <b>same log in the same order</b>, so replaying it
+      gives the same balance everywhere — that is why replication is possible at
+      all. The leader appends first; an entry becomes <b>committed</b> only once a
+      majority has stored it, and only then is it <b>applied</b>.
+    </div>
+  </div>
+  <div class="panel">
+    <h2>Who leads what, right now</h2>
+    <div id="leaderChart"></div>
+    <div class="hint">
+      One leader per <b>shard</b>, not one per cluster. Kill a leader and only that
+      shard re-elects — the others carry on, which is why the term numbers drift
+      apart. A machine can lead one shard while following another.
+    </div>
+  </div>
+  <div class="panel">
+    <h2>Inside each machine</h2>
+    <div id="nodeDetail"></div>
+    <div class="hint">
+      A machine is not a shard. Each row is one <b>replica</b> — one copy of one
+      shard's log living on this machine. <b>commit</b> is how far a majority
+      agreed; <b>applied</b> is how far this replica folded into its balances.
+      Applied trailing commit is normal and momentary; applied trailing the other
+      replicas is what "lagging" means.
+    </div>
+  </div>
+  <div class="panel">
+    <h2>Balances derived from those logs</h2>
+    <div id="repBalances"></div>
+    <div class="hint">
+      Balances are a <b>fold over the log</b>, never the thing copied. Two machines
+      showing different balances means one has applied fewer entries — not that the
+      data diverged.
+    </div>
+  </div>
+</div>
 
+<div class="panel">
+  <h2>Event log — what happened, and who caused it</h2>
+  <div class="ctlrow evfilters">
+    <label>account <select id="fAccount"><option value="">any</option></select></label>
+    <label>shard <select id="fShard"><option value="">any</option></select></label>
+    <label>machine <select id="fNode"><option value="">any</option></select></label>
+    <label>kind
+      <select id="fKind">
+        <option value="">all but drift</option>
+        <option value="client">client operations</option>
+        <option value="raft">raft / consensus</option>
+        <option value="control">operator actions</option>
+        <option value="drift">health drift only</option>
+        <option value="__all">everything incl. drift</option>
+      </select>
+    </label>
+    <button id="fClear">clear</button>
+    <span id="fCount" style="color:var(--faint)"></span>
+  </div>
+  <div class="log" id="events"></div>
+  <div class="hint">
+    <b>client</b> is an operation someone asked for. <b>raft</b> is the cluster
+    acting on its own — elections, catch-up, re-replication — which is the part no
+    click causes. <b>control</b> is this dashboard killing or reviving machines.
+    <br><br>
+    Watch for <span class="warn">INDETERMINATE</span>: the entry <i>is</i> in the
+    leader's log and may still commit. It is not a refusal, and the correct
+    response is to retry with the <b>same</b> idempotency key.
+  </div>
 </div>
 
 <script>
 'use strict';
 
 const $ = (id) => document.getElementById(id);
-const money = (cents) => (cents / 100).toFixed(2);
+const money = (c) => (c / 100).toFixed(2);
 
-let selectedShard = null;
+let view = null;
+let story = 'cap';
+let pickedShard = null;
+let selectedAccount = null;
+const pending = new Set();
 
-// ---- live stream -----------------------------------------------------------
+const COLOURS = ['#60a5fa', '#4ade80', '#facc15', '#f472b6', '#a78bfa', '#fb923c',
+                 '#22d3ee', '#c084fc', '#fb7185', '#34d399', '#e879f9', '#f59e0b'];
+const colourOf = {};
+
+// ---------------------------------------------------------------------------
+// Keyed reconcile — the whole fix for "buttons are hard to click".
 //
-// EventSource reconnects on its own, which is most of why SSE is enough here:
-// there is no reconnect logic to write. Each frame is a COMPLETE snapshot, so a
-// missed frame is harmless — the next one is fully current.
-const source = new EventSource('/api/stream');
+// The problem was never the refresh RATE. It was that every paint replaced the
+// container's innerHTML, so the element under the cursor was destroyed and
+// recreated between mousedown and mouseup — the click then landed on a node that
+// no longer existed. A 60fps game updates far more often and its buttons work,
+// because it MUTATES elements instead of replacing them.
+//
+// reconcile() keeps one DOM node per logical item, identified by a stable key:
+// existing nodes are updated in place, new ones appended, departed ones removed.
+// Event handlers are bound once at creation and survive every update, so a click
+// target is never swapped out mid-gesture.
+//
+// Nothing clickable is ever rebuilt. Purely textual regions (log entries, the
+// event feed) may still be replaced wholesale, because there is nothing there to
+// aim at.
+function reconcile(container, items, keyOf, create, update) {
+  const seen = new Set();
 
-source.onopen = () => {
-  $('connDot').className = 'dot up';
-  $('connText').textContent = 'streaming';
-};
-source.onerror = () => {
-  $('connDot').className = 'dot down';
-  $('connText').textContent = 'reconnecting…';
-};
-source.onmessage = (e) => {
-  try { render(JSON.parse(e.data)); } catch (err) { /* skip a malformed frame */ }
-};
+  items.forEach((item, i) => {
+    const key = keyOf(item);
+    seen.add(key);
 
-// ---- control ---------------------------------------------------------------
+    let el = container._byKey && container._byKey.get(key);
+    if (!el) {
+      el = create(item);
+      el.dataset.key = key;
+      if (!container._byKey) container._byKey = new Map();
+      container._byKey.set(key, el);
+    }
+    update(el, item);
 
-async function post(path) {
-  try {
-    const r = await fetch(path, { method: 'POST' });
-    return await r.json();
-  } catch (err) {
-    return { ok: false, err: String(err) };
+    // Keep DOM order matching data order without detaching a node that is
+    // already in the right place — reinserting is what would break a click.
+    const at = container.children[i];
+    if (at !== el) container.insertBefore(el, at || null);
+  });
+
+  if (container._byKey) {
+    for (const [key, el] of container._byKey) {
+      if (!seen.has(key)) { el.remove(); container._byKey.delete(key); }
+    }
   }
 }
 
-async function killNode(id)   { await post('/api/kill?node=' + encodeURIComponent(id)); }
-async function reviveNode(id) { await post('/api/revive?node=' + encodeURIComponent(id)); }
+// ---- stream ---------------------------------------------------------------
 
-window.killNode = killNode;
-window.reviveNode = reviveNode;
+const source = new EventSource('/api/stream');
+source.onopen = () => { $('connDot').className = 'dot up'; $('connText').textContent = 'live'; };
+source.onerror = () => { $('connDot').className = 'dot down'; $('connText').textContent = 'reconnecting…'; };
+source.onmessage = (e) => {
+  try { view = JSON.parse(e.data); paint(); } catch (err) { /* skip a bad frame */ }
+};
+
+// ---- tabs (bound once, never re-created) -----------------------------------
+
+function showStory(s) {
+  story = s;
+  $('tabCap').className = 'tab' + (s === 'cap' ? ' on' : '');
+  $('tabRep').className = 'tab' + (s === 'rep' ? ' on' : '');
+  $('storyCap').className = s === 'cap' ? '' : 'hidden';
+  $('storyRep').className = s === 'rep' ? '' : 'hidden';
+  paint();
+}
+$('tabCap').onclick = () => showStory('cap');
+$('tabRep').onclick = () => showStory('rep');
+
+// ---- control ---------------------------------------------------------------
+
+// The builder inputs describe the cluster you WANT, not the cluster you have.
+//
+// They used to be overwritten from live state on every frame, guarded only by
+// document.activeElement. At a 100ms stream tick that rewrites them 10x a second,
+// and the guard does not hold for a spinner-arrow click - the arrows can change
+// the value without leaving the input focused. The typed value was erased before
+// it could be submitted, which looked exactly like "adding nodes does nothing".
+// The account field has no such sync, which is why THAT control always worked.
+//
+// So: once the user touches a builder input it is theirs (dirty), and live state
+// stops writing to it. Re-syncing happens only after a rebuild actually lands.
+const builderIds = ['inShards', 'inNodes', 'inRF'];
+const builderDirty = new Set();
+
+builderIds.forEach(id => {
+  const el = $(id);
+  // 'input' covers typing, spinner clicks, and paste alike.
+  el.addEventListener('input', () => builderDirty.add(id));
+});
+
+function syncBuilderInputs(force) {
+  if (force) builderDirty.clear();
+  const live = {
+    inShards: view.shards.length,
+    inNodes: view.node_count,
+    inRF: view.replication_factor,
+  };
+  builderIds.forEach(id => {
+    if (builderDirty.has(id) || document.activeElement === $(id)) return;
+    $(id).value = live[id];
+  });
+  markBuilderPending();
+}
+
+// Show whether the inputs describe the running cluster or a pending change, so a
+// value sitting in the box is never mistaken for a cluster that was rebuilt.
+function markBuilderPending() {
+  const differs = $('inShards').value != view.shards.length ||
+                  $('inNodes').value != view.node_count ||
+                  $('inRF').value != view.replication_factor;
+  $('btnResize').classList.toggle('armed', differs);
+  if (differs && !$('resizeMsg').dataset.busy) {
+    $('resizeMsg').innerHTML =
+      '<span style="color:var(--amber)">pending - press rebuild to apply</span>';
+  } else if (!differs && !$('resizeMsg').dataset.busy) {
+    $('resizeMsg').textContent = '';
+  }
+}
+
+async function post(url) {
+  try { return await (await fetch(url, { method: 'POST' })).json(); }
+  catch (e) { return { ok: false, err: String(e) }; }
+}
+
+async function act(kind, id) {
+  if (pending.has(id)) return;
+  pending.add(id);
+  paint();
+  await post(`/api/${kind}?node=${encodeURIComponent(id)}`);
+  // Held briefly past the response so the frame carrying the new state arrives
+  // before the button becomes clickable again — otherwise it flips label under
+  // the cursor.
+  setTimeout(() => { pending.delete(id); paint(); }, 400);
+}
+
+$('btnWrite').onclick = async () => {
+  const s = targetShard();
+  if (!s) return;
+  const acct = Object.keys(s.accounts)[0] || firstAccountOf(s.id);
+  if (!acct) { $('tryResult').textContent = 'no account on that shard yet'; return; }
+
+  $('tryResult').textContent = 'sending…';
+  const r = await post(`/api/tx?op=deposit&key=cap-${Date.now()}&to=${acct}&amount=100`);
+  $('tryResult').innerHTML = r.ok
+    ? `<span style="color:var(--green)">COMMITTED — a majority agreed</span>`
+    : `<span style="color:var(--red)">REFUSED — ${r.err || 'no majority'}</span>`;
+};
+
+$('btnDeposit').onclick = async () => {
+  const s = view.shards.find(x => x.id === pickedShard) || view.shards[0];
+  const acct = Object.keys(s.accounts)[0];
+  if (!acct) { $('repResult').textContent = 'no account on that shard'; return; }
+
+  $('repResult').textContent = 'sending…';
+  const r = await post(`/api/tx?op=deposit&key=rep-${Date.now()}&to=${acct}&amount=250`);
+  $('repResult').innerHTML = r.ok
+    ? `<span style="color:var(--green)">committed — watch it turn green below</span>`
+    : `<span style="color:var(--red)">${r.err || 'refused'}</span>`;
+};
+
+$('btnResize').onclick = async () => {
+  const b = $('btnResize');
+  b.disabled = true;
+  $('resizeMsg').dataset.busy = '1';
+  $('resizeMsg').textContent = 'rebuilding...';
+
+  const r = await post(`/api/resize?shards=${$('inShards').value}&nodes=${$('inNodes').value}&rf=${$('inRF').value}`);
+
+  if (r.ok) {
+    // The request landed, so the inputs now describe the live cluster again and
+    // may go back to tracking it.
+    builderDirty.clear();
+    selectedAccount = null;   // the old ring is gone; a stale selection is a lie
+    ringKey = '';             // force a ring redraw against the new topology
+    $('resizeMsg').innerHTML = '<span style="color:var(--green)">rebuilt</span>';
+  } else {
+    $('resizeMsg').innerHTML = '<span style="color:var(--red)">' + (r.err || 'failed') + '</span>';
+  }
+
+  delete $('resizeMsg').dataset.busy;
+  b.disabled = false;
+};
+
+$('btnAdd').onclick = async () => {
+  const name = $('inAcct').value.trim();
+  if (!name) { $('addMsg').textContent = 'name required'; return; }
+
+  $('addMsg').textContent = 'opening...';
+  const r = await post('/api/open?account=' + encodeURIComponent(name) +
+                       '&amount=' + $('inAmt').value);
+  if (r.ok) {
+    // The interesting part is WHERE it landed, which the ring decided with no
+    // coordination at all.
+    $('addMsg').innerHTML = '<span style="color:var(--green)">opened - see the ring</span>';
+    $('inAcct').value = '';
+    selectedAccount = name;
+  } else {
+    $('addMsg').innerHTML = '<span style="color:var(--red)">' + (r.err || 'failed') + '</span>';
+  }
+};
+
+// Prefer a shard that currently CANNOT write, so "attempt a write" demonstrates
+// the refusal the story is about rather than a success.
+function targetShard() {
+  if (!view) return null;
+  return view.shards.find(s => !s.can_write && Object.keys(s.accounts).length)
+      || view.shards.find(s => Object.keys(s.accounts).length)
+      || view.shards[0];
+}
+
+function firstAccountOf(id) {
+  const s = view.shards.find(x => x.id === id);
+  return s ? Object.keys(s.accounts)[0] : null;
+}
 
 // ---- render ----------------------------------------------------------------
 
-function render(view) {
-  $('clockText').textContent = view.time;
-  $('totalMoney').textContent = money(view.total_money);
-  $('shardCount').textContent = view.shards.length + ' shards';
+function paint() {
+  if (!view) return;
 
-  renderShards(view.shards);
-  renderRing(view.ring, view.shards);
-  renderTxs(view.shards);
-  renderEvents(view.events);
+  if (!pickedShard && view.shards.length) pickedShard = view.shards[0].id;
+
+  $('topo').textContent =
+    `${view.shards.length} shards replicated across ${view.machines.length} machines`;
+
+  const dark = view.shards.filter(s => s.unreachable);
+  $('total').innerHTML = dark.length
+    ? `${money(view.total_money)} <span style="color:var(--red)">(incomplete — ${dark.map(s => s.id).join(', ')} dark)</span>`
+    : money(view.total_money);
+
+  view.shards.forEach((sh, i) => { colourOf[sh.id] = COLOURS[i % COLOURS.length]; });
+
+  // Keep the builder inputs showing the cluster's ACTUAL shape, so the controls
+  // never claim a topology that is not running. Skipped for the field being
+  // edited, or typing would fight the stream.
+  syncBuilderInputs();
+  $('vnodeCount').textContent = view.vnodes;
+
+  paintRing();
+
+  if (story === 'cap') { paintCapShards(); paintMachines(); }
+  else { paintPicker(); paintLogs(); paintRepBalances(); paintLeaderChart(); paintNodeDetail(); }
+  // Events are no longer painted from the state frame: they are fetched on their
+  // own timer so the server can apply the filter (see loadEvents).
 }
 
-function renderShards(shards) {
-  $('shards').innerHTML = shards.map(s => {
-    const badge = s.ready
-      ? '<span class="badge ready">READY</span>'
-      : '<span class="badge notready">NOT READY</span>';
-    const doubt = s.in_doubt > 0
-      ? `<span class="badge indoubt">${s.in_doubt} IN DOUBT</span>` : '';
+function paintCapShards() {
+  reconcile($('capShards'), view.shards, s => s.id,
+    () => {
+      const el = document.createElement('div');
+      el.innerHTML = `<div class="cap-head">
+          <span class="nm"></span><span class="accts"></span><span class="quorum"></span>
+        </div><div class="verdict"><div class="v w"></div><div class="v r"></div></div>`;
+      return el;
+    },
+    (el, s) => {
+      el.className = 'shard-cap' + (!s.can_read ? ' broken' : (!s.can_write ? ' degraded' : ''));
+      el.querySelector('.nm').textContent = s.id;
+      el.querySelector('.accts').textContent =
+        Object.keys(s.accounts).sort().map(a => `${a} ${money(s.accounts[a])}`).join(' · ') || 'no accounts';
+      el.querySelector('.quorum').textContent =
+        `${s.live}/${s.nodes.length} up · needs ${s.needed} · ` +
+        (s.leader ? `leader ${s.leader} (term ${s.term})` : 'no leader');
 
-    const nodes = s.nodes.map(n => {
-      const cls = ['node'];
-      if (n.crashed) cls.push('down');
-      else if (n.lagging) cls.push('lagging');
+      const w = el.querySelector('.v.w');
+      w.className = 'v w ' + (s.can_write ? 'yes' : 'no');
+      w.innerHTML = s.can_write
+        ? `<div class="k">WRITES ACCEPTED</div><div class="why">${s.live} of ${s.nodes.length} up — a majority of ${s.needed} agrees</div>`
+        : `<div class="k">WRITES REFUSED</div><div class="why">${s.live} up, ${s.needed} needed. Accepting now would commit money no majority has seen.</div>`;
 
-      const btn = n.crashed
-        ? `<button class="revive" onclick="reviveNode('${n.id}')">revive</button>`
-        : `<button onclick="killNode('${n.id}')">kill</button>`;
+      const r = el.querySelector('.v.r');
+      r.className = 'v r ' + (!s.can_read ? 'no' : (s.can_write ? 'yes' : 'stale'));
+      r.innerHTML = !s.can_read
+        ? `<div class="k">READS IMPOSSIBLE</div><div class="why">every replica is down — nothing left to read from</div>`
+        : (s.can_write
+          ? `<div class="k">READS CURRENT</div><div class="why">a leader can confirm with a majority before answering</div>`
+          : `<div class="k">READS STALE</div><div class="why">the last agreed value is still here, but nothing can update it</div>`);
+    });
+}
 
-      const lag = n.lagging ? ' <span class="lag">lagging</span>' : '';
+function paintMachines() {
+  reconcile($('capMachines'), view.machines, m => m.id,
+    (m) => {
+      const el = document.createElement('div');
+      el.innerHTML =
+        '<div class="mn">' + m.id + '</div>' +
+        '<div class="ml"></div>' +
+        '<div class="hbar"><div class="hseg"></div><div class="hseg"></div><div class="hseg"></div></div>' +
+        '<div class="hrow">' +
+          '<button class="hpick low" data-lvl="low">LOW</button>' +
+          '<button class="hpick normal" data-lvl="normal">NORM</button>' +
+          '<button class="hpick high" data-lvl="high">HIGH</button>' +
+          '<button class="hlock" title="lock health against drift">LOCK</button>' +
+        '</div>' +
+        '<div class="reps"></div><button class="killbtn"></button>';
 
-      return `<div class="${cls.join(' ')}">
-        <div class="name">${n.id}</div>
-        <span class="role ${n.role}">${n.role.toUpperCase()}</span>
-        <div class="stats">
-          term ${n.term} &middot; log ${n.log_len}<br>
-          commit ${n.commit} &middot; applied ${n.applied}${lag}
-        </div>
-        ${btn}
-      </div>`;
-    }).join('');
+      // Health controls, bound once at creation like every other click target.
+      el.querySelectorAll('.hpick').forEach(b => {
+        b.onclick = (ev) => {
+          ev.stopPropagation();
+          post('/api/health?node=' + m.id + '&level=' + b.dataset.lvl);
+        };
+      });
+      el.querySelector('.hlock').onclick = (ev) => {
+        ev.stopPropagation();
+        // Locked toggles back to drifting; unlocked pins at the current level.
+        if (el.dataset.locked === 'true') {
+          post('/api/health?node=' + m.id + '&unlock=1');
+        } else {
+          post('/api/health?node=' + m.id + '&level=' + (el.dataset.health || 'normal'));
+        }
+      };
+      // Bound ONCE. This handler outlives every update, which is the point.
+      el.querySelector('.killbtn').onclick = () =>
+        act(el.dataset.crashed === 'true' ? 'revive' : 'kill', m.id);
+      return el;
+    },
+    (el, m) => {
+      el.dataset.crashed = String(m.crashed);
+      el.className = 'machine' + (m.crashed ? ' down' : '');
+      el.querySelector('.ml').textContent = m.crashed
+        ? 'down — every shard on it lost a replica'
+        : ((m.leader_of || []).length ? `leads ${m.leader_of.join(', ')}` : 'follower for all shards');
 
-    const accounts = Object.keys(s.accounts).sort().map(a => {
-      const held = (s.reserved && s.reserved[a]) || 0;
-      const heldTxt = held ? `<span class="reserved">${money(held)} held</span>` : '';
-      return `<tr><td>${a}</td><td class="num">${money(s.accounts[a])}</td><td>${heldTxt}</td></tr>`;
-    }).join('');
+      // Replica rows carry no click targets, so replacing their markup is safe.
+      el.querySelector('.reps').innerHTML = m.replicas.map(r =>
+        `<div class="rp"><span class="s">${r.shard}</span>
+           <span class="role ${r.role}">${r.role.toUpperCase()}</span>
+           <span class="ix">idx ${r.applied}</span></div>`).join('');
 
-    const table = accounts
-      ? `<table><thead><tr><th>Account</th><th class="num">Balance</th><th></th></tr></thead>
-         <tbody>${accounts}</tbody></table>`
-      : '<div class="hint">no accounts on this shard</div>';
+      // Health bar + controls reflect the machine's current level.
+      el.dataset.health = m.health;
+      el.dataset.locked = String(m.health_locked);
+      el.querySelector('.hbar').className = 'hbar ' + m.health;
+      el.querySelectorAll('.hpick').forEach(b => {
+        b.className = 'hpick ' + b.dataset.lvl + (b.dataset.lvl === m.health ? ' on' : '');
+      });
+      const lk = el.querySelector('.hlock');
+      lk.className = 'hlock' + (m.health_locked ? ' on' : '');
+      lk.textContent = m.health_locked ? 'LOCKED' : 'LOCK';
 
-    const reason = (!s.ready && s.reason)
-      ? `<div class="hint" style="color:var(--red)">${s.reason}</div>` : '';
+      const b = el.querySelector('.killbtn');
+      const busy = pending.has(m.id);
+      b.disabled = busy;
+      b.className = 'killbtn ' + (m.crashed ? 'revive' : 'kill');
+      b.textContent = busy ? (m.crashed ? 'REVIVING...' : 'KILLING...')
+                           : (m.crashed ? 'REVIVE THIS MACHINE' : 'KILL THIS MACHINE');
+    });
+}
 
-    return `<div class="shard">
-      <div class="shard-head">
-        <span>${s.id}</span> ${badge} ${doubt}
-        <span class="meta">leader ${s.leader || '—'} &middot; term ${s.term}</span>
-      </div>
-      <div class="nodes">${nodes}</div>
-      ${reason}
-      <div style="margin-top:8px">${table}</div>
-    </div>`;
+function paintPicker() {
+  reconcile($('shardPicker'), view.shards, s => s.id,
+    (s) => {
+      const el = document.createElement('span');
+      el.onclick = () => { pickedShard = s.id; paint(); };
+      return el;
+    },
+    (el, s) => {
+      el.className = 'chip' + (s.id === pickedShard ? ' on' : '');
+      const accts = Object.keys(s.accounts).sort().join(', ') || 'empty';
+      el.innerHTML = `${s.id} <span style="color:var(--faint)">${accts}</span>`;
+    });
+}
+
+function rowsForPicked() {
+  return view.machines
+    .map(m => ({ machine: m, rep: m.replicas.find(r => r.shard === pickedShard) }))
+    .filter(x => x.rep);
+}
+
+function paintLogs() {
+  const rows = rowsForPicked();
+  $('logCols').style.gridTemplateColumns = `repeat(${Math.max(rows.length, 1)}, 1fr)`;
+
+  reconcile($('logCols'), rows, x => x.machine.id,
+    () => {
+      const el = document.createElement('div');
+      el.innerHTML = `<h3><span class="who"></span><span class="role"></span>
+                      <span class="ix"></span></h3><div class="entries"></div>`;
+      return el;
+    },
+    (el, { machine, rep }) => {
+      el.className = 'logcol' + (machine.crashed ? ' down' : '');
+      el.querySelector('.who').textContent = machine.id;
+      const role = el.querySelector('.role');
+      role.className = 'role ' + rep.role;
+      role.textContent = rep.role.toUpperCase();
+      el.querySelector('.ix').textContent = `commit ${rep.commit} · applied ${rep.applied}`;
+      el.querySelector('.entries').innerHTML = (rep.log || []).map(e =>
+        `<div class="entry ${e.applied ? 'applied' : (e.committed ? 'committed' : '')}">` +
+        `<span class="i">${e.index}</span> ${e.summary}</div>`).join('')
+        || `<div class="entry">empty</div>`;
+    });
+}
+
+function paintRepBalances() {
+  const rows = rowsForPicked();
+  const host = $('repBalances');
+  if (!host._inner) {
+    host.innerHTML = `<div class="machines"></div>`;
+    host._inner = host.querySelector('.machines');
+  }
+
+  reconcile(host._inner, rows, x => x.machine.id,
+    () => {
+      const el = document.createElement('div');
+      el.innerHTML = `<div class="mn"></div><div class="ml"></div><div class="reps"></div>`;
+      return el;
+    },
+    (el, { machine, rep }) => {
+      el.className = 'machine' + (machine.crashed ? ' down' : '');
+      el.querySelector('.mn').textContent = machine.id;
+      el.querySelector('.ml').textContent = `from ${rep.applied} applied entries`;
+      const names = Object.keys(rep.accounts).sort();
+      el.querySelector('.reps').innerHTML = names.length
+        ? names.map(a => `<div class="rp"><span class="s">${a}</span>
+            <span class="ix">${money(rep.accounts[a])}</span></div>`).join('')
+        : `<div class="rp"><span style="color:var(--faint)">nothing applied yet</span></div>`;
+    });
+}
+
+// Both circles are redrawn only when their CONTENT changes. Placement and hash
+// positions do not move unless a shard, account or machine appears, so rewriting
+// the SVG on every frame would destroy the dot under the cursor for no gain.
+let ringKey = '';
+function paintRing() {
+  const key = JSON.stringify([
+    (view.arcs || []).map(a => [a.shard, a.start.toFixed(1), a.end.toFixed(1)]),
+    (view.ring || []).map(p => [p.account, p.shard, p.angle.toFixed(2)]),
+    view.shards.map(sh => [sh.id, sh.nodes.map(n => n.id), sh.live, sh.can_write]),
+    view.machines.map(m => [m.id, m.crashed]),
+    selectedAccount,
+  ]);
+  if (key === ringKey) return;
+  ringKey = key;
+
+  paintHashRing();
+  paintPlacementCircle();
+  paintTrace();
+
+  const sid = selectedAccount ? shardOf(selectedAccount) : null;
+  $('arrowMid').className = 'arrow-between' + (sid ? ' on' : '');
+}
+
+// CIRCLE 1: the hash ring. Keys land at crc32 positions; arcs show which shard
+// owns which span of hash space.
+function paintHashRing() {
+  const cx = 150, cy = 150, r = 96, w = 19;
+  let out = '<circle cx="' + cx + '" cy="' + cy + '" r="' + r +
+            '" fill="none" stroke="#2a2f3a" stroke-width="' + w + '"/>';
+
+  const sel = selectedAccount ? shardOf(selectedAccount) : null;
+
+  (view.arcs || []).forEach(a => {
+    const dim = sel && sel !== a.shard;
+    out += arcPath(cx, cy, r, w, a.start, a.end, colourOf[a.shard] || '#374151', dim ? 0.14 : 0.85);
+  });
+
+  (view.ring || []).forEach(p => {
+    const rad = (p.angle - 90) * Math.PI / 180;
+    const x = cx + (r + 12) * Math.cos(rad), y = cy + (r + 12) * Math.sin(rad);
+    const lx = cx + (r + 28) * Math.cos(rad), ly = cy + (r + 28) * Math.sin(rad);
+    const on = selectedAccount === p.account;
+    const c = colourOf[p.shard] || '#9ca3af';
+
+    out += '<g class="clickable" onclick="pickAccount(&quot;' + p.account + '&quot;)">' +
+      '<circle cx="' + x + '" cy="' + y + '" r="' + (on ? 7 : 4.5) + '" fill="' + c + '"' +
+      (on ? ' stroke="#f472b6" stroke-width="3"' : '') + '/>' +
+      '<text x="' + lx + '" y="' + ly + '" text-anchor="middle" dominant-baseline="middle" ' +
+      'fill="' + (on ? '#fbcfe8' : '#9ca3af') + '" font-weight="' + (on ? 700 : 400) + '">' +
+      p.account + '</text></g>';
+  });
+
+  if (selectedAccount) {
+    const p = (view.ring || []).find(x => x.account === selectedAccount);
+    out += label(cx, cy - 10, selectedAccount, '#fbcfe8', 700, 14);
+    out += label(cx, cy + 8, (p ? p.angle.toFixed(1) + String.fromCharCode(176) + ' -> ' : '') + (sel || '-'), '#9ca3af');
+  } else {
+    out += label(cx, cy - 4, view.shards.length + ' shards', '#6b7280');
+    out += label(cx, cy + 12, 'click an account', '#6b7280');
+  }
+
+  $('ringA').innerHTML = out;
+}
+
+// CIRCLE 2: placement. Machines evenly spaced — NOT hashed, because they are not
+// hashed. Drawing them at pseudo-hash positions would invent a mechanism the code
+// does not have.
+function paintPlacementCircle() {
+  const cx = 150, cy = 150, r = 96;
+  const machines = view.machines;
+  const n = machines.length || 1;
+  const sel = selectedAccount ? shardOf(selectedAccount) : null;
+  const holders = sel
+    ? machines.filter(m => m.replicas.some(rr => rr.shard === sel)).map(m => m.id)
+    : [];
+
+  let out = '<circle cx="' + cx + '" cy="' + cy + '" r="' + r +
+            '" fill="none" stroke="#2a2f3a" stroke-width="1.5"/>';
+
+  machines.forEach((m, i) => {
+    const ang = (i / n) * 360 - 90;
+    const rad = ang * Math.PI / 180;
+    const x = cx + r * Math.cos(rad), y = cy + r * Math.sin(rad);
+    const lx = cx + (r + 30) * Math.cos(rad), ly = cy + (r + 30) * Math.sin(rad);
+    const hit = holders.includes(m.id);
+
+    // A machine's shards as small coloured pips, so "what does this hold" is
+    // readable without clicking.
+    const shards = m.replicas.map(rr => rr.shard);
+    shards.forEach((sh, k) => {
+      const off = (k - (shards.length - 1) / 2) * 9;
+      const px = x + off * Math.cos(rad + Math.PI / 2);
+      const py = y + off * Math.sin(rad + Math.PI / 2);
+      const dim = sel && sh !== sel;
+      out += '<circle cx="' + px + '" cy="' + py + '" r="3.4" fill="' +
+        (colourOf[sh] || '#374151') + '" opacity="' + (dim ? 0.22 : 0.95) + '"/>';
+    });
+
+    out += '<g class="clickable" onclick="pickMachine(&quot;' + m.id + '&quot;)">' +
+      '<circle cx="' + x + '" cy="' + y + '" r="' + (hit ? 15 : 12) + '" ' +
+      'fill="' + (m.crashed ? '#3f1d1d' : '#1d212b') + '" ' +
+      'stroke="' + (hit ? '#f472b6' : (m.crashed ? '#7f1d1d' : '#2f3542')) + '" ' +
+      'stroke-width="' + (hit ? 3 : 1.5) + '"/>' +
+      '<text x="' + lx + '" y="' + ly + '" text-anchor="middle" dominant-baseline="middle" ' +
+      'fill="' + (hit ? '#fbcfe8' : (m.crashed ? '#f87171' : '#9ca3af')) + '" ' +
+      'font-weight="' + (hit ? 700 : 400) + '">' + m.id +
+      (m.crashed ? ' (down)' : '') + '</text></g>';
+
+    // A spoke to each holder, so the replica set reads as a set rather than three
+    // unrelated highlights.
+    if (hit) {
+      out += '<line x1="' + cx + '" y1="' + cy + '" x2="' + x + '" y2="' + y +
+             '" stroke="#f472b6" stroke-width="1.5" opacity="0.5"/>';
+    }
+  });
+
+  if (sel) {
+    out += label(cx, cy - 10, sel, colourOf[sel] || '#fbcfe8', 700, 13);
+    out += label(cx, cy + 8, 'on ' + holders.length + ' machines', '#9ca3af');
+  } else {
+    out += label(cx, cy - 4, n + ' machines', '#6b7280');
+    out += label(cx, cy + 12, 'evenly spaced, not hashed', '#6b7280');
+  }
+
+  $('ringB').innerHTML = out;
+}
+
+function label(x, y, text, fill, weight, size) {
+  return '<text x="' + x + '" y="' + y + '" text-anchor="middle" fill="' + fill +
+    '" font-weight="' + (weight || 400) + '"' +
+    (size ? ' font-size="' + size + '"' : '') + '>' + text + '</text>';
+}
+
+// The path through BOTH decisions, spelled out, because the whole point is that
+// they are separate steps rather than one lookup.
+function paintTrace() {
+  if (!selectedAccount) {
+    $('pathTrace').innerHTML =
+      '<div class="hint" style="text-align:center">Click an account on the left circle ' +
+      'to trace it through both decisions.</div>';
+    return;
+  }
+  const p = (view.ring || []).find(x => x.account === selectedAccount);
+  const sid = shardOf(selectedAccount);
+  const holders = view.machines.filter(m => m.replicas.some(rr => rr.shard === sid));
+  const idle = view.node_count - holders.length;
+
+  $('pathTrace').innerHTML =
+    '<div class="trace">' +
+    '<span class="step">1.</span> <code>crc32("' + selectedAccount + '")</code> lands at <b>' +
+    (p ? p.angle.toFixed(1) : '?') + String.fromCharCode(176) +
+    '</b>, and the first shard clockwise is <b>' + sid + '</b>. No table, no coordination.' +
+    '<br><span class="step">2.</span> Placement puts <b>' + sid + '</b> on <b>' +
+    holders.map(m => m.id).join(', ') + '</b> &mdash; ' + view.replication_factor +
+    ' copies, chosen by rule rather than by hash.' +
+    '<br><span class="step">3.</span> ' + idle + ' of ' + view.node_count +
+    ' machines hold <b>no copy</b> of ' + selectedAccount +
+    '; they can fail without it noticing. A majority of <b>' +
+    (Math.floor(holders.length / 2) + 1) + '</b> of those ' + holders.length +
+    ' must agree before its balance can change.' +
+    '</div>';
+}
+
+function shardOf(account) {
+  const p = (view.ring || []).find(p => p.account === account);
+  return p ? p.shard : null;
+}
+
+function pickAccount(a) {
+  selectedAccount = (selectedAccount === a) ? null : a;
+  paint();
+}
+
+// Clicking a machine selects an account it holds, so the trace still shows a full
+// path rather than half of one.
+function pickMachine(id) {
+  const m = view.machines.find(x => x.id === id);
+  if (!m || !m.accounts.length) { selectedAccount = null; paint(); return; }
+  selectedAccount = m.accounts[0];
+  paint();
+}
+
+window.pickAccount = pickAccount;
+window.pickMachine = pickMachine;
+
+// arcPath draws one ring segment as an SVG donut slice.
+function arcPath(cx, cy, r, w, a0, a1, colour, opacity) {
+  const ro = r + w / 2, ri = r - w / 2;
+  const t0 = (a0 - 90) * Math.PI / 180, t1 = (a1 - 90) * Math.PI / 180;
+  const large = (a1 - a0) > 180 ? 1 : 0;
+  return '<path d="M ' + (cx + ro * Math.cos(t0)) + ' ' + (cy + ro * Math.sin(t0)) +
+    ' A ' + ro + ' ' + ro + ' 0 ' + large + ' 1 ' + (cx + ro * Math.cos(t1)) + ' ' + (cy + ro * Math.sin(t1)) +
+    ' L ' + (cx + ri * Math.cos(t1)) + ' ' + (cy + ri * Math.sin(t1)) +
+    ' A ' + ri + ' ' + ri + ' 0 ' + large + ' 0 ' + (cx + ri * Math.cos(t0)) + ' ' + (cy + ri * Math.sin(t0)) +
+    ' Z" fill="' + colour + '" opacity="' + opacity + '"/>';
+}
+
+// ---------------------------------------------------------------- event log
+//
+// Fetched separately from the SSE state stream, because the filter is a QUERY:
+// the server does the selecting, so narrowing to one account does not mean
+// pulling the whole log and discarding most of it in the browser.
+let evKey = '';
+
+function esc(t) {
+  return String(t).replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+}
+
+const FILTER_IDS = ['fAccount', 'fShard', 'fNode', 'fKind'];
+
+async function loadEvents() {
+  const qs = new URLSearchParams();
+  const vals = {
+    account: $('fAccount').value,
+    shard:   $('fShard').value,
+    node:    $('fNode').value,
+    kind:    $('fKind').value,
+  };
+  Object.entries(vals).forEach(([k, v]) => { if (v && v !== '__all') qs.set(k, v); });
+  qs.set('limit', '120');
+
+  // Health drift is excluded unless explicitly asked for: at one line per machine
+  // every 5s it otherwise fills the whole window and hides the events that
+  // actually explain what the cluster did.
+  if (!vals.kind) qs.set('exclude_kind', 'drift');
+
+  let data;
+  try {
+    data = await (await fetch('/api/events?' + qs.toString())).json();
+  } catch (e) {
+    return; // a dropped poll is not worth surfacing; the next one will land
+  }
+  if (!data || !data.events) return;
+
+  fillAxes(data.axes || {});
+
+  const key = JSON.stringify(data.events.map(e => e.seq));
+  if (key === evKey) return;
+  evKey = key;
+
+  // Newest first: during an incident the interesting line is the last one, and
+  // making the reader scroll to it is the wrong default.
+  const rows = data.events.slice().reverse();
+
+  $('fCount').textContent = rows.length
+    ? rows.length + ' event' + (rows.length === 1 ? '' : 's')
+    : 'nothing matches this filter';
+
+  $('events').innerHTML = rows.map(e => {
+    let cls = '';
+    if (e.outcome === 'indeterminate') cls = 'warn';
+    else if (e.outcome === 'refused' || /KILLED|FAILED|LOST/i.test(e.text)) cls = 'bad';
+    else if (e.outcome === 'ok') cls = 'hot';
+
+    return '<div class="evrow">' +
+      '<span class="evkind ' + e.kind + '">' + e.kind + '</span>' +
+      '<span class="evat">' + e.at + '</span>' +
+      '<span class="evtext ' + cls + '">' + esc(e.text) + '</span>' +
+      '</div>';
   }).join('');
 }
 
-// Colours are assigned by shard INDEX, so a shard keeps its colour between
-// frames — a ring whose colours shuffle on every update is unreadable.
-const SHARD_COLOURS = ['#60a5fa', '#4ade80', '#facc15', '#f472b6', '#a78bfa', '#fb923c'];
+// Populate the filter dropdowns from what the log actually contains, so the
+// options never name an account or machine that does not exist.
+function fillAxes(axes) {
+  const map = { fAccount: axes.accounts, fShard: axes.shards, fNode: axes.nodes };
+  Object.entries(map).forEach(([id, list]) => {
+    const el = $(id);
+    const opts = list || [];
 
-function renderRing(points, shards) {
-  const svg = $('ring');
-  const cx = 150, cy = 150, r = 105;
-  const colourOf = {};
-  shards.forEach((s, i) => { colourOf[s.id] = SHARD_COLOURS[i % SHARD_COLOURS.length]; });
+    // The selection is read back BEFORE any rebuild and restored after,
+    // unconditionally.
+    //
+    // Setting innerHTML on a <select> destroys its options, and destroying the
+    // selected option resets .value to "". The axes grow as events accumulate
+    // (a new account, a healed replica on a new machine), so this fired
+    // repeatedly on a 700ms poll and silently cleared the shard and machine
+    // filters a moment after they were chosen — the account filter looked fine
+    // only because its list happened to settle first.
+    //
+    // The previous guard also restored the value only when it appeared in the NEW
+    // list, so a filter naming something that had aged out of the log was dropped
+    // rather than kept.
+    const cur = el.value;
 
-  let out = `<circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="#2a2f3a" stroke-width="1.5"/>`;
+    const want = JSON.stringify(opts);
+    if (el.dataset.filled !== want) {
+      el.dataset.filled = want;
+      el.innerHTML = '<option value="">any</option>' +
+        opts.map(v => '<option value="' + esc(v) + '">' + esc(v) + '</option>').join('');
+    }
 
-  // Shard arcs: where each shard's virtual nodes sit is not exposed, so the ring
-  // shows the KEYS, which is the part that actually moves when placement changes.
-  points.forEach(p => {
-    const rad = (p.angle - 90) * Math.PI / 180;
-    const x = cx + r * Math.cos(rad), y = cy + r * Math.sin(rad);
-    const lx = cx + (r + 20) * Math.cos(rad), ly = cy + (r + 20) * Math.sin(rad);
-    const c = colourOf[p.shard] || '#9ca3af';
-    out += `<line x1="${cx}" y1="${cy}" x2="${x}" y2="${y}" stroke="${c}" stroke-width="0.5" opacity="0.25"/>`;
-    out += `<circle cx="${x}" cy="${y}" r="5" fill="${c}"/>`;
-    out += `<text x="${lx}" y="${ly}" class="ring-label" text-anchor="middle" dominant-baseline="middle">${p.account}</text>`;
+    // Keep the user's choice even if it is no longer in the list: they asked for
+    // it, and a filter that quietly resets itself is worse than one that shows
+    // nothing and says so.
+    if (cur && el.value !== cur) {
+      if (!opts.includes(cur)) {
+        el.innerHTML += '<option value="' + esc(cur) + '">' + esc(cur) + '</option>';
+        el.dataset.filled = '';   // force a clean rebuild once it reappears
+      }
+      el.value = cur;
+    }
   });
-
-  // Legend in the middle.
-  shards.forEach((s, i) => {
-    const y = cy - (shards.length - 1) * 7 + i * 14;
-    out += `<circle cx="${cx - 34}" cy="${y}" r="4" fill="${colourOf[s.id]}"/>`;
-    out += `<text x="${cx - 25}" y="${y}" class="ring-label" dominant-baseline="middle">${s.id}</text>`;
-  });
-
-  svg.innerHTML = out;
 }
 
-function renderTxs(shards) {
-  // Merged across shards and sorted by HLC timestamp — which is exactly what the
-  // per-shard Seq counter cannot do, and the reason HLC exists.
-  const all = [];
-  shards.forEach(s => (s.recent || []).forEach(t => all.push({ shard: s.id, ...t })));
-  all.sort((a, b) => (b.wall - a.wall) || (b.logical - a.logical));
+FILTER_IDS.forEach(id => {
+  $(id).onchange = () => { evKey = ''; loadEvents(); };
+});
+$('fClear').onclick = () => {
+  FILTER_IDS.forEach(id => { $(id).value = ''; });
+  evKey = '';
+  loadEvents();
+};
 
-  $('txs').innerHTML = all.slice(0, 14).map(t =>
-    `<div><span style="color:var(--faint)">${t.ts}</span>  ` +
-    `<span style="color:var(--blue)">${t.shard}</span>  ${t.op}  ${t.summary}</div>`
-  ).join('') || '<div>no transactions yet</div>';
+setInterval(loadEvents, 700);
+loadEvents();
+
+// ------------------------------------------------------- leader/follower chart
+//
+// One row per shard, because leadership is per shard. A single cluster-wide
+// "the leader" line would be the exact misreading this view exists to correct.
+let leaderKey = '';
+function paintLeaderChart() {
+  const key = JSON.stringify(view.shards.map(sh => [
+    sh.id, sh.leader, sh.term, (sh.nodes || []).map(n => [n.id, n.role, n.crashed, n.lagging]),
+  ]));
+  if (key === leaderKey) return;
+  leaderKey = key;
+
+  $('leaderChart').innerHTML = '<div class="lchart">' + view.shards.map(sh => {
+    const nodes = (sh.nodes || []).map(n => {
+      let cls = 'lnode ';
+      let tag = '';
+      if (n.crashed) { cls += 'down'; tag = ' ✕'; }
+      else if (n.role === 'Leader') { cls += 'leader'; tag = ' ★'; }
+      else if (n.lagging) { cls += 'lag'; tag = ' ⟳'; }
+      else { cls += 'follower'; }
+      return '<span class="' + cls + '">' + n.id + tag + '</span>';
+    }).join('');
+
+    const lead = sh.leader
+      ? '<span class="lterm">leader <b style="color:#86efac">' + sh.leader + '</b> · term ' + sh.term + '</span>'
+      : '<span class="lnone">NO LEADER — electing</span>';
+
+    return '<div class="lrow"><div class="lhead">' +
+      '<span class="lname">' + sh.id + '</span>' + lead +
+      '</div><div class="lnodes">' + nodes + '</div></div>';
+  }).join('') + '</div>';
 }
 
-function renderEvents(events) {
-  $('events').innerHTML = (events || []).map(e => {
-    let cls = '';
-    if (/KILLED|FAILED|violation/i.test(e)) cls = 'bad';
-    else if (/INDETERMINATE|in doubt|refused/i.test(e)) cls = 'warn';
-    else if (/REVIVED|ok|resolved/i.test(e)) cls = 'hot';
-    return `<div class="${cls}">${e}</div>`;
+// ------------------------------------------------------------- node detail
+//
+// The inverse of the shard view: shards grouped by machine rather than machines
+// grouped by shard. Same data, and the pivot is the point - it is what shows a
+// machine leading one shard while following another.
+let nodeKey = '';
+function paintNodeDetail() {
+  const key = JSON.stringify(view.machines.map(m => [
+    m.id, m.crashed, m.health,
+    (m.replicas || []).map(r => [r.shard, r.role, r.term, r.commit, r.applied, r.log_len]),
+  ]));
+  if (key === nodeKey) return;
+  nodeKey = key;
+
+  $('nodeDetail').innerHTML = view.machines.map(m => {
+    const reps = m.replicas || [];
+    const body = reps.length
+      ? '<table class="ndtable"><tr>' +
+          '<th>shard</th><th>role</th><th>term</th><th>commit</th><th>applied</th><th>log</th>' +
+        '</tr>' + reps.map(r =>
+          '<tr>' +
+            '<td>' + r.shard + '</td>' +
+            '<td class="ndrole ' + r.role + '">' + r.role + '</td>' +
+            '<td>' + r.term + '</td>' +
+            '<td>' + r.commit + '</td>' +
+            '<td>' + r.applied + (r.applied < r.commit ? ' <span class="warn">↑</span>' : '') + '</td>' +
+            '<td>' + r.log_len + '</td>' +
+          '</tr>').join('') + '</table>'
+      : '<div class="ndempty">holds no replica - with RF fixed, a machine can be idle. ' +
+        'It can fail without any account noticing.</div>';
+
+    const leads = (m.leader_of || []).length;
+    return '<div class="ndcard"><div class="ndhead">' +
+      '<span>' + m.id + (m.crashed ? ' <span class="bad">(down)</span>' : '') + '</span>' +
+      '<span class="lterm">' + leads + ' leadership' + (leads === 1 ? '' : 's') + '</span>' +
+      '</div>' + body + '</div>';
   }).join('');
 }
 </script>

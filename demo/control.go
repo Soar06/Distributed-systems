@@ -1,6 +1,7 @@
 package demo
 
 import (
+	"errors"
 	"fmt"
 	"time"
 
@@ -27,13 +28,37 @@ func (c *Cluster) Open(account ledger.AccountID, amount ledger.Money) (ledger.Re
 
 	if err == nil && res.OK {
 		c.mu.Lock()
-		c.accounts = append(c.accounts, account)
+		// Only once. Opening the same account twice returned OK from the
+		// idempotency cache and appended a SECOND ring entry, so the account
+		// appeared twice in the placement view — a display bug that made the ring
+		// look wrong when the ledger was right.
+		if !contains(idsToStrings(c.accounts), string(account)) {
+			c.accounts = append(c.accounts, account)
+		}
 		c.mu.Unlock()
-		c.logf("opened %s with %s on %s", account, amount, c.sc.Coordinator.ShardFor(account))
+		sid := c.sc.Coordinator.ShardFor(account)
+		c.logEvent(Event{
+			Kind: KindClient, Outcome: "ok",
+			Account: string(account), Shard: string(sid),
+			Text: fmt.Sprintf("opened %s with %s on %s", account, amount, sid),
+		})
 	} else {
-		c.logf("open %s FAILED: %v %s", account, err, res.Err)
+		c.logEvent(Event{
+			Kind: KindClient, Outcome: "refused",
+			Account: string(account), Shard: string(c.sc.Coordinator.ShardFor(account)),
+			Text: fmt.Sprintf("open %s FAILED: %v %s", account, err, res.Err),
+		})
 	}
 	return res, err
+}
+
+// idsToStrings converts account ids for the membership check above.
+func idsToStrings(ids []ledger.AccountID) []string {
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, string(id))
+	}
+	return out
 }
 
 // Transact performs a deposit, withdrawal, or transfer.
@@ -66,17 +91,31 @@ func (c *Cluster) Transact(op, key string, from, to ledger.AccountID, amount led
 
 	switch {
 	case err == nil && res.OK:
-		c.logf("%s %s ok (key %s) balance=%s", op, amount, key, res.Balance)
-	case err == shard.ErrInDoubt:
+		c.logEvent(Event{
+			Kind: KindClient, Outcome: "ok",
+			Account: string(txAccount(from, to)), Shard: string(c.sc.Coordinator.ShardFor(txAccount(from, to))),
+			Text: fmt.Sprintf("%s %s ok (key %s) balance=%s", op, amount, key, res.Balance),
+		})
+	case errors.Is(err, shard.ErrInDoubt), errors.Is(err, shard.ErrCommitUnknown):
 		// Surfaced as its own case, never as a plain failure: the outcome is
-		// unknown and the entry may yet commit.
-		c.logf("%s %s INDETERMINATE (key %s) — retry with the same key", op, amount, key)
+		// unknown and the entry may yet commit. ErrCommitUnknown is the
+		// single-shard form — the entry is in the leader's log, waiting for a
+		// majority to come back.
+		c.logEvent(Event{
+			Kind: KindClient, Outcome: "indeterminate",
+			Account: string(txAccount(from, to)), Shard: string(c.sc.Coordinator.ShardFor(txAccount(from, to))),
+			Text: fmt.Sprintf("%s %s INDETERMINATE (key %s) — entry is in the log, awaiting quorum; retry with the same key", op, amount, key),
+		})
 	default:
 		reason := res.Err
 		if reason == "" && err != nil {
 			reason = err.Error()
 		}
-		c.logf("%s %s refused (key %s): %s", op, amount, key, reason)
+		c.logEvent(Event{
+			Kind: KindClient, Outcome: "refused",
+			Account: string(txAccount(from, to)), Shard: string(c.sc.Coordinator.ShardFor(txAccount(from, to))),
+			Text: fmt.Sprintf("%s %s refused (key %s): %s", op, amount, key, reason),
+		})
 	}
 	return res, err
 }
@@ -103,7 +142,10 @@ func (c *Cluster) Kill(id raft.NodeID) error {
 	c.mu.Unlock()
 
 	g.Net.Crash(id)
-	c.logf("KILLED %s", id)
+	c.logEvent(Event{
+		Kind: KindControl, Node: string(id),
+		Text: fmt.Sprintf("KILLED %s", id),
+	})
 	return nil
 }
 
@@ -128,7 +170,10 @@ func (c *Cluster) Revive(id raft.NodeID) error {
 	c.mu.Unlock()
 
 	g.Net.Restore(id)
-	c.logf("REVIVED %s — catching up from the leader", id)
+	c.logEvent(Event{
+		Kind: KindControl, Node: string(id),
+		Text: fmt.Sprintf("REVIVED %s — catching up from the leader", id),
+	})
 	return nil
 }
 
@@ -166,4 +211,17 @@ func (c *Cluster) groupOf(id raft.NodeID) (*sim.ShardGroup, bool) {
 		}
 	}
 	return nil, false
+}
+
+// txAccount picks the account an operation is "about" for filtering.
+//
+// A transfer names two, and the debit side is the one whose shard coordinates the
+// 2PC — so From wins when present. Recording only one account is a deliberate
+// simplification: the filter answers "show me what happened to Vu", and a
+// transfer out of Vu is exactly that.
+func txAccount(from, to ledger.AccountID) ledger.AccountID {
+	if from != "" {
+		return from
+	}
+	return to
 }

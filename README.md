@@ -130,7 +130,53 @@ go run ./cmd/demo
 # dashboard: http://127.0.0.1:8080/cluster-dashboard/
 ```
 
-One process runs a 3-shard cluster and serves both UIs. Open the dashboard
+Stop it with **Ctrl+C** in that terminal.
+
+There is no separate frontend to start: `cmd/demo` is one process that runs the
+cluster AND serves the UI files straight from `fe/`. No build step, no npm, no
+second port — editing a file in `fe/` and refreshing the page is the whole loop.
+
+#### Options
+
+| Flag | Default | What it does |
+|---|---|---|
+| `-shards` | 3 | slices of the keyspace (more = more parallel writes) |
+| `-nodes` | 3 | machines in the cluster |
+| `-replication-factor` | 3 | machines each shard is copied onto |
+| `-listen` | `127.0.0.1:8080` | address for the UI |
+| `-ui` | `fe` | directory holding the UI files |
+| `-seed` | 42 | seed for the simulated network (same seed = same layout) |
+| `-seed-accounts` | true | open a few accounts at startup |
+
+A useful shape for seeing placement rather than co-location — more machines than
+the replication factor, so some machines hold nothing and can fail without any
+account noticing:
+
+```bash
+go run ./cmd/demo -shards 2 -nodes 5 -replication-factor 3
+```
+
+`-nodes` must be at least `-replication-factor`: a shard cannot have more copies
+than there are machines to put them on, and the demo refuses rather than quietly
+shrinking the replication factor.
+
+#### Two things that will waste your time if you hit them
+
+**"The port is in use" / the UI shows the wrong cluster.** An older run is still
+holding `:8080`. It serves perfectly valid *stale* responses, so this looks like
+a code bug rather than a stray process — a 3-node cluster reporting five machines
+is the giveaway. Find and stop it:
+
+```bash
+netstat -ano | findstr ":8080.*LISTENING"   # last column is the PID
+taskkill /PID <pid> /F
+```
+
+**UI changes not taking effect.** The server now sends `Cache-Control: no-store`,
+so a normal refresh is enough. If you are running an older build, hard-refresh
+with **Ctrl+Shift+R**.
+
+One process runs the cluster and serves both UIs. Open the dashboard
 beside the bank app and:
 
 - **Kill the leader** of a shard from the dashboard. Watch a survivor take over

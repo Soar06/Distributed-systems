@@ -104,9 +104,18 @@ func (s *Server) tick() {
 func (s *Server) resetElectionTimerLocked() {
 	span := s.cfg.ElectionTimeoutMax - s.cfg.ElectionTimeoutMin
 	d := s.cfg.ElectionTimeoutMin
+
 	if span > 0 {
-		d += s.rnd.Int63n(span)
+		// Randomized across the FULL window first (§5.2: randomization is what
+		// breaks split votes), then scaled by health so a healthier node tends to
+		// campaign sooner (health_priority.go).
+		//
+		// Scaling rather than banding is deliberate: confining each health level to
+		// its own slice of the window narrowed the randomness and raised the
+		// minimum timeout, which broke elections outright.
+		d += int64(float64(s.rnd.Int63n(span)) * s.NodeHealth().electionBias())
 	}
+
 	s.electionDeadline = time.Now().Add(time.Duration(d) * time.Millisecond)
 }
 

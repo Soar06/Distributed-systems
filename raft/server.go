@@ -89,6 +89,11 @@ type Server struct {
 	snapshotErrs    int
 	lastSnapshotErr error
 
+	// health biases how eagerly this server campaigns (health_priority.go). It
+	// changes WHO TRIES FIRST, never who is allowed to win — the up-to-date check
+	// in RequestVote is untouched.
+	health healthAtomic
+
 	// lastLeaderContact is when a leader last reached this server, for the
 	// disruptive-server check (membership.go).
 	lastLeaderContact time.Time

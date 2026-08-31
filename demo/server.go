@@ -2,6 +2,7 @@ package demo
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -37,7 +38,7 @@ func Listen(addr, dir string, c *Cluster) (*Server, error) {
 	s := &Server{cluster: c, listener: l}
 
 	mux := http.NewServeMux()
-	mux.Handle("/", http.FileServer(http.Dir(dir)))
+	mux.Handle("/", noCache(http.FileServer(http.Dir(dir))))
 	mux.HandleFunc("/api/stream", s.handleStream)
 	mux.HandleFunc("/api/state", s.handleState)
 	mux.HandleFunc("/api/open", s.handleOpen)
@@ -45,6 +46,11 @@ func Listen(addr, dir string, c *Cluster) (*Server, error) {
 	mux.HandleFunc("/api/kill", s.handleKill)
 	mux.HandleFunc("/api/revive", s.handleRevive)
 	mux.HandleFunc("/api/recover", s.handleRecover)
+	mux.HandleFunc("/api/resize", s.handleResize)
+	mux.HandleFunc("/api/health", s.handleHealth)
+	mux.HandleFunc("/api/heal", s.handleHeal)
+	mux.HandleFunc("/api/underreplicated", s.handleUnderReplicated)
+	mux.HandleFunc("/api/events", s.handleEvents)
 
 	s.http = &http.Server{
 		Handler: mux,
@@ -167,6 +173,76 @@ func (s *Server) handleRecover(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, out)
 }
 
+// handleResize rebuilds the cluster with a new shape.
+//
+// A teaching control, not a production one — see demo/resize.go for why adding a
+// machine to a LIVE sharded cluster is live resharding rather than wiring.
+func (s *Server) handleResize(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	shards, _ := strconv.Atoi(q.Get("shards"))
+	nodes, _ := strconv.Atoi(q.Get("nodes"))
+	rf, _ := strconv.Atoi(q.Get("rf"))
+
+	cur := func() (int, int, int) { return s.cluster.Topology() }
+	cs, cn, crf := cur()
+	if shards == 0 {
+		shards = cs
+	}
+	if nodes == 0 {
+		nodes = cn
+	}
+	if rf == 0 {
+		rf = crf
+	}
+
+	if err := s.cluster.Resize(shards, nodes, rf); err != nil {
+		writeJSON(w, map[string]any{"ok": false, "err": err.Error()})
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true, "shards": shards, "nodes": nodes, "rf": rf})
+}
+
+// handleHealth sets or unlocks a machine's simulated health.
+//
+// Health biases how eagerly a machine campaigns; it never changes who is allowed
+// to win. See demo/health.go and raft/health_priority.go.
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	node := raft.NodeID(q.Get("node"))
+
+	if q.Get("unlock") == "1" {
+		if err := s.cluster.UnlockHealth(node); err != nil {
+			writeJSON(w, map[string]any{"ok": false, "err": err.Error()})
+			return
+		}
+		writeJSON(w, map[string]any{"ok": true, "locked": false})
+		return
+	}
+
+	var level raft.NodeHealth
+	switch q.Get("level") {
+	case "low":
+		level = raft.HealthLow
+	case "high":
+		level = raft.HealthHigh
+	case "normal":
+		level = raft.HealthNormal
+	default:
+		writeJSON(w, map[string]any{"ok": false, "err": "level must be low, normal or high"})
+		return
+	}
+
+	// Setting a level pins it by default: an operator who picks a value expects it
+	// to stay, and having it drift away seconds later would look like the control
+	// did not work.
+	lock := q.Get("lock") != "0"
+	if err := s.cluster.SetHealth(node, level, lock); err != nil {
+		writeJSON(w, map[string]any{"ok": false, "err": err.Error()})
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true, "level": level.String(), "locked": lock})
+}
+
 // replyOf maps a ledger result and error onto the client contract the UI shows.
 //
 // The four outcomes are preserved exactly, because collapsing them is the failure
@@ -184,7 +260,10 @@ func replyOf(res ledger.Result, err error) map[string]any {
 		if !res.OK {
 			out["err"] = res.Err
 		}
-	case err == shard.ErrInDoubt:
+	// errors.Is, not ==, because ErrCommitUnknown is wrapped with the underlying
+	// timeout. A bare == silently falls through to default and reports the very
+	// "plain failure" this case exists to prevent.
+	case errors.Is(err, shard.ErrInDoubt), errors.Is(err, shard.ErrCommitUnknown):
 		out["indeterminate"] = true
 		out["err"] = err.Error()
 	case err == shard.ErrTxAborted:
@@ -203,4 +282,82 @@ func replyOf(res ledger.Result, err error) map[string]any {
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(v)
+}
+
+// handleHeal re-replicates every shard that is under-replicated but still has a
+// majority. Shards below majority are reported as skipped, with the reason —
+// see demo/heal.go for why they must not be "fixed".
+func (s *Server) handleHeal(w http.ResponseWriter, r *http.Request) {
+	results := s.cluster.Heal()
+
+	healed := 0
+	for _, res := range results {
+		if res.Added != "" {
+			healed++
+		}
+	}
+	writeJSON(w, map[string]any{
+		"ok":      true,
+		"healed":  healed,
+		"results": results,
+	})
+}
+
+// handleUnderReplicated reports which shards are missing replicas, without
+// changing anything.
+func (s *Server) handleUnderReplicated(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, map[string]any{
+		"ok":     true,
+		"shards": s.cluster.UnderReplicatedShards(),
+	})
+}
+
+// handleEvents returns the structured event log, optionally filtered.
+//
+// Filters are AND-ed: ?account=Vu&kind=client narrows to that account's own
+// operations. An absent filter matches everything, so the default is the full
+// stream.
+func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+
+	limit := 200
+	if v := q.Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			limit = n
+		}
+	}
+
+	events := s.cluster.Events(EventFilter{
+		Account:     q.Get("account"),
+		Shard:       q.Get("shard"),
+		Node:        q.Get("node"),
+		Kind:        EventKind(q.Get("kind")),
+		ExcludeKind: EventKind(q.Get("exclude_kind")),
+	}, limit)
+
+	writeJSON(w, map[string]any{
+		"ok":     true,
+		"events": events,
+		"axes":   s.cluster.EventAxes(),
+	})
+}
+
+// noCache stops the browser serving a stale copy of the dashboard.
+//
+// The file server sends only Last-Modified, which lets a browser reuse a cached
+// page without revalidating. During development that means edits to the UI appear
+// not to take effect: the server is correct, the file on disk is correct, and the
+// browser is running yesterday's JavaScript. It cost a full debugging pass here —
+// the filter code was proven correct in a headless DOM while the browser kept
+// showing the old behaviour.
+//
+// This is a teaching demo whose files change constantly, so correctness of what
+// is displayed matters far more than caching a few kilobytes.
+func noCache(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
+		w.Header().Set("Pragma", "no-cache")
+		w.Header().Set("Expires", "0")
+		h.ServeHTTP(w, r)
+	})
 }

@@ -74,6 +74,8 @@
   .outcome.indeterminate { background: #ca8a0426; color: var(--amber); }
 
   .hint { font-size: 11px; color: var(--faint); line-height: 1.55; margin-top: 8px; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  td { padding: 5px 6px; border-bottom: 1px solid #1e222b; font-variant-numeric: tabular-nums; }
   .warnbox {
     font-size: 11px; color: var(--amber); background: #78350f22;
     border: 1px solid #78350f; border-radius: 6px; padding: 8px; margin-top: 10px;
@@ -85,8 +87,19 @@
 
 <h1>Bank App <span id="windowTag" style="font-size:12px;color:var(--faint)"></span></h1>
 <div class="sub">
-  One window = one client session. Open several against the <b>same account</b> and
-  fire at once to see what the backend really does.
+  One window = one client session into <b>one shared bank</b>. Open several against
+  the <b>same account</b> and fire at once to see what the backend really does.
+</div>
+
+<div class="panel" style="border-color:#1e3a8a;background:#1e3a8a12">
+  <h2 style="color:var(--blue)">All Accounts In This Bank</h2>
+  <table id="allAccounts"><tbody></tbody></table>
+  <div class="hint">
+    Every account here is in the <b>same</b> distributed system — this window just
+    picks which one to act as. Accounts sit on different <b>shards</b> (slices of
+    the one cluster), and a transfer between shards is still one atomic
+    transaction. Watch the total: it never changes when money moves.
+  </div>
 </div>
 
 <div class="panel">
@@ -195,7 +208,43 @@ function onView(view) {
     fillSelect($('account'), accounts);
     fillSelect($('to'), accounts);
   }
+  renderAllAccounts(view);
   refreshBalance();
+}
+
+// The whole bank, so it is obvious this is ONE system with accounts spread over
+// shards rather than a separate bank per window.
+function renderAllAccounts(view) {
+  const mine = $('account').value;
+  const rows = [];
+
+  view.shards.forEach(s => {
+    if (s.unreachable) {
+      rows.push(`<tr><td colspan="3" style="color:var(--red)">` +
+        `${s.id}: every replica is down — its accounts cannot be read from anywhere` +
+        `</td></tr>`);
+      return;
+    }
+    Object.keys(s.accounts).sort().forEach(a => {
+      const held = (s.reserved && s.reserved[a]) || 0;
+      rows.push(
+        `<tr${a === mine ? ' style="background:#1e3a8a26"' : ''}>` +
+        `<td>${a === mine ? '<b>' + a + '</b> ← this window' : a}</td>` +
+        `<td style="color:var(--faint)">${s.id}${s.ready ? '' : ' <span style="color:var(--red)">not ready</span>'}</td>` +
+        `<td style="text-align:right">${money(s.accounts[a])}` +
+        (held ? ` <span class="held">(${money(held)} held)</span>` : '') +
+        `</td></tr>`);
+    });
+  });
+
+  const missing = view.shards.filter(s => s.unreachable);
+  rows.push(`<tr><td colspan="2" style="color:var(--faint)">` +
+    (missing.length
+      ? 'total of the READABLE accounts (some shards unreachable)'
+      : 'total across the whole bank') +
+    `</td><td style="text-align:right"><b>${money(view.total_money)}</b></td></tr>`);
+
+  $('allAccounts').querySelector('tbody').innerHTML = rows.join('');
 }
 
 function fillSelect(sel, names) {
@@ -232,7 +281,10 @@ function refreshBalance() {
   $('balance').textContent = '—';
 }
 
-$('account').addEventListener('change', refreshBalance);
+$('account').addEventListener('change', () => {
+  refreshBalance();
+  if (lastView) renderAllAccounts(lastView);
+});
 
 // ---- sending ---------------------------------------------------------------
 

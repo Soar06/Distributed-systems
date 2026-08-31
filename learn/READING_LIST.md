@@ -10,6 +10,12 @@ learned in, which is roughly the order they were needed.
 
 ## Where each topic lives in the code
 
+> For the function-by-function version — which exact function implements which
+> rule of Figure 2, which test holds each of Figure 3's five safety properties,
+> and where this project deliberately departs from the paper — see
+> **[CODE_MAP.md](CODE_MAP.md)**. The table below is the index; that document is
+> the detail.
+
 All four phases and the G1-G7 hardening sequence are complete, so every entry
 below now has an implementation to read alongside the paper. That pairing is the
 point of this file: the source says what the idea is, the code says what it cost
@@ -1121,3 +1127,179 @@ an unauthenticated endpoint on a bank.
 ## Not yet logged (topics to add as they come up)
 
 - Follower reads (LATER.md)
+
+## 21. Re-replication: healing a shard that lost a replica but kept quorum
+
+**What it is.** When a machine holding a replica dies permanently, the shard is
+left under-replicated: it still works, but it can now survive fewer further
+failures. Re-replication restores the replication factor by adding a replica on
+a spare machine and dropping the dead one.
+
+**What problem it solves.** RF=3 tolerates one failure. After one machine dies
+you are at 2 replicas — still a quorum, but the *next* failure breaks the shard.
+Without healing, a cluster degrades monotonically: every crash permanently lowers
+the fault tolerance of whatever shards that machine held. Re-replication returns
+the shard to full RF so the tolerance budget is renewed.
+
+**The precondition that makes it safe — and it is absolute.**
+
+> Re-replication requires a **surviving majority** of the shard.
+
+A new replica is populated by the ordinary Raft catch-up path (AppendEntries, or
+InstallSnapshot when the leader has compacted past what the follower needs, §7).
+Both are driven by a **leader**, and a leader only exists with a majority. So:
+
+- lose 1 of 3 → 2 alive → majority holds → a leader exists → **healing works**
+- lose 2 of 3 → 1 alive → no majority → no leader → **nothing to copy from**
+
+There is no mechanism, in Raft or outside it, that reconstructs committed data
+from a below-majority set. The data is not gone (it is on disk in the dead
+machines' logs) but it is unreadable until enough of them return.
+
+**The tempting wrong answer.** When a shard has lost majority, a system could
+"heal" it by creating a fresh empty replica set on healthy machines. The shard
+becomes writable again and the dashboard turns green. This **silently resets
+every balance in that shard to zero** — it does not recover the data, it discards
+it and hides the loss. That is an AP choice (stay available, lose consistency)
+in a system that has committed to CP, and for a ledger it is the worst possible
+failure mode: money vanishes with no error returned.
+
+This project therefore refuses to heal a below-majority shard, and reports it as
+unreachable until its machines come back.
+
+**How it uses §6 rather than working around it.** Adding and removing a replica
+are ordinary configuration changes: `AddServer` / `RemoveServer` append a config
+entry to the leader's log, and it takes effect on append, not on commit. Healing
+is therefore not a new consensus mechanism — it is a policy layer that decides
+*when* to call the membership API the paper already specifies.
+
+**Order matters: add first, then remove.** Going the other way (remove the dead
+replica, then add the spare) passes through a moment at RF-1 with the
+configuration already shrunk. Adding first means the cluster is never less
+redundant than it started, and §6's one-change-at-a-time rule is respected by
+waiting for each change to commit before making the next.
+
+**Primary sources**
+- Ongaro, *Consensus: Bridging Theory and Practice* (PhD dissertation, 2014),
+  **§4.1** — single-server membership changes; the catch-up phase for a new
+  server before it is added to the configuration.
+- Ongaro & Ousterhout, Raft extended paper, **§6** (membership changes) and
+  **§7** (snapshotting — how a lagging or brand-new replica is brought up to
+  date when the leader has already compacted its log).
+- Google SRE Book, ch. 23 *Managing Critical State* — why durable systems
+  re-replicate on failure rather than waiting for repair.
+
+**Where it lives in the code:** `demo/heal.go` (policy: when to heal),
+`raft/membership.go` (mechanism: §6 config changes). See
+[CODE_MAP.md](CODE_MAP.md) §8.
+
+## 22. Does consensus scale? Read/write asymmetry, and why this project serves reads from the leader
+
+**The question this answers.** Raft allows writes only on the leader. So where
+does scaling come from — and if reads could be served by every replica, is Raft
+"built for huge reads"?
+
+**Raft is a fault-tolerance algorithm, not a scaling algorithm.** It makes three
+machines behave like one *reliable* machine. It is strictly SLOWER than a single
+machine: every write pays a round trip to a majority. Nothing about Raft makes a
+system faster than the one node it replaces.
+
+Distributed systems solve three separable problems, and conflating them is the
+usual source of this confusion:
+
+| Problem | Solved by | Not solved by |
+|---|---|---|
+| Surviving machine failure | replication (Raft) | sharding |
+| Getting past one machine's throughput | **sharding** | Raft |
+| Putting data near users | placement/geo | either |
+
+**So scaling comes from sharding, and Raft is applied per shard.** One leader per
+shard is a bottleneck for THAT SHARD ONLY. Four shards means four leaders, four
+logs, four independent commit paths. Measured in this project: **3.3-4.6x
+throughput at 4 shards** — not because Raft got faster, but because there were
+four Raft groups instead of one.
+
+The limit worth stating honestly: **a single account is still capped at one
+leader's throughput.** Sharding scales the aggregate, never a single hot key.
+
+**The wrong answer, and why it is wrong.** A load balancer routing writes to
+whichever node is least busy would break consensus outright: two nodes accepting
+writes for the same account is precisely the split-brain Election Safety forbids.
+This project does have a router (`shard.Coordinator`), but it routes on DATA
+OWNERSHIP — `Ring.Lookup(key)` -> shard -> that shard's leader — never on load.
+
+### The read/write asymmetry
+
+Writes must go through one leader. Reads *could* be served by every replica, so
+reads scale ~RF× without any sharding at all. That asymmetry is real and is why
+read replicas are ubiquitous.
+
+The catch: **a follower can be behind.** Replication is asynchronous — a follower
+acknowledges an entry when it APPENDS it and applies it slightly later. So:
+
+```
+leader   : Vu = 9500    (committed and applied)
+follower : Vu = 10000   (entry replicated, not yet applied)
+```
+
+Both are legal Raft states. Reading the follower yields a value that was true a
+moment ago — a **stale read**, which breaks linearizability. A client can commit a
+withdrawal, immediately read, and not see its own write.
+
+Three read modes, and what each costs:
+
+| Mode | Served from | Guarantee | Scales |
+|---|---|---|---|
+| Leader read (`ReadIndex`, §8) | leader only | linearizable | no |
+| Follower read, stale | any replica | eventual | ~RF× |
+| Follower read + `ReadIndex` | any replica | linearizable | partly |
+
+The third is how TiKV and etcd get read scaling without abandoning correctness:
+the follower asks the leader only for its current `commitIndex` (a tiny RPC),
+waits until its own `lastApplied` reaches it, then serves the read LOCALLY. The
+leader stays a coordination point rather than a data path.
+
+### [project decision] Reads are served from the leader, and staleness is refused
+
+**This project serves reads only from a replica known to be current, and never
+offers a stale-read mode.** `ReadIndex` (`raft/read.go:52`) and
+`LinearizableRead` (`:146`) are the only read paths, and the demo UI additionally
+picks `freshestMachine()` and flags `Unreachable` so a balance is never rendered
+from a lagging replica.
+
+**Why, given that this costs the ~RF× read scaling:**
+
+- **A stale balance is a wrong balance.** For a feed or a product catalogue,
+  200ms of staleness is invisible. For a ledger it is the difference between "you
+  have 10000" and "you had 10000 a second ago" — and an overdraft check against a
+  stale balance lets money leave an account that no longer holds it.
+- **It would contradict the system's stated contract.** This project is CP and
+  advertises linearizable operations. Adding a read path that silently returns
+  older data would make the guarantee conditional on which endpoint a client
+  happened to hit — the guarantee would become a coincidence.
+- **The demo's purpose is to show the trade-off, not to hide it.** The UI exists
+  to make CAP visible. A read path that stays "available" during a partition by
+  serving stale data would demonstrate the opposite of what the system claims.
+
+**What is deliberately left open.** The *mechanism* for follower reads already
+exists — every replica runs a full state machine, and `LinearizableRead` reads
+under that machine's lock. What is missing is only the routing decision and a
+staleness policy. Adding follower reads later would therefore be an ADDITION on
+top of the theory (Rules §4), not a contradiction of it, PROVIDED it is opt-in
+per request and the weaker guarantee is stated in the response rather than
+inferred by the caller. A silent downgrade of every read would be the opposite.
+
+**Primary sources**
+- Ongaro & Ousterhout, Raft extended paper, **§8** — client interaction, the
+  `ReadIndex` optimisation, and why a leader must confirm leadership before
+  serving a read.
+- Ongaro, *Consensus: Bridging Theory and Practice*, **§6.4** — lease-based and
+  index-based read-only queries, including serving them from followers.
+- Herlihy & Wing (1990), *Linearizability: A Correctness Condition for Concurrent
+  Objects* — the guarantee a stale read gives up.
+- etcd docs, *serializable vs linearizable reads*; TiKV docs, *follower read* —
+  two production systems exposing exactly this choice to the caller.
+
+**Where it lives in the code:** `raft/read.go` (`ReadIndex`, `LinearizableRead`),
+`demo/demo.go` (`freshestMachine`, `Unreachable`). See [CODE_MAP.md](CODE_MAP.md)
+§10.

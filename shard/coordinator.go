@@ -36,6 +36,24 @@ var (
 	// client otherwise sends them retrying a write that never existed while
 	// treating the outcome as unknown.
 	ErrNotLeader = errors.New("shard: this node does not lead the shard owning that account")
+
+	// ErrCommitUnknown means the entry WAS appended to the leader's log but did
+	// not commit within the timeout. Like ErrInDoubt it is indeterminate — the
+	// difference is only which layer is blocked (a single shard's replication
+	// here, the 2PC coordinator there).
+	//
+	// This is the single-shard analogue of ErrInDoubt, and it was previously
+	// returned as a formatted string that the client API bucketed as an ordinary
+	// failure. That is the exact confusion ErrNotLeader's comment warns about,
+	// pointed the other way: the API said "refused" about a write that was
+	// sitting in the leader's log and DID commit as soon as a majority returned.
+	// A caller told "refused" may reasonably reissue with a NEW idempotency key,
+	// which would double-apply once both entries commit.
+	//
+	// Appended-but-not-committed is the normal state of a write during a partition
+	// or a majority outage. It is not an error about the request; it is an honest
+	// "I cannot tell you yet". Retry with the SAME key.
+	ErrCommitUnknown = errors.New("shard: entry appended but commit unconfirmed; retry with the same key")
 )
 
 // Group is one shard's Raft group, as the coordinator needs to see it.
@@ -147,6 +165,16 @@ func (c *Coordinator) single(s ID, cmd ledger.Command) (ledger.Result, error) {
 	}
 	res, isLeader, err := g.Propose(Command{Op: OpSingle, Ledger: cmd}, c.commitTimeout)
 	if err != nil {
+		// isLeader distinguishes the two failures that look alike from outside.
+		//
+		//   isLeader=false — nothing was ever proposed. A clean rejection.
+		//   isLeader=true  — the entry IS in the log and may still commit.
+		//
+		// Collapsing the second into a plain error is what made a majority outage
+		// look like a refusal while the write was quietly waiting to commit.
+		if isLeader {
+			return ledger.Result{}, fmt.Errorf("%w: %v", ErrCommitUnknown, err)
+		}
 		return ledger.Result{}, err
 	}
 	if !isLeader {
