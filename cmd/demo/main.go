@@ -40,6 +40,7 @@ func main() {
 		replicas = flag.Int("replication-factor", 3, "machines each shard is replicated onto")
 		seed     = flag.Int64("seed", 42, "seed for the simulated network")
 		seedDemo = flag.Bool("seed-accounts", true, "open a few accounts at startup")
+		dataDir  = flag.String("data", "", "directory for durable state; empty keeps everything in RAM")
 	)
 	flag.Parse()
 
@@ -53,7 +54,7 @@ func main() {
 			"have more replicas than there are machines to hold them", *replicas, *nodes)
 	}
 
-	cluster, err := demo.New(*shards, *nodes, *replicas, *seed)
+	cluster, err := demo.NewWithStorage(*shards, *nodes, *replicas, *seed, *dataDir)
 	if err != nil {
 		log.Fatalf("demo: %v", err)
 	}

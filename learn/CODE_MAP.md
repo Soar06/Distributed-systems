@@ -253,9 +253,29 @@ This project uses the **single-server** change of §6, not joint consensus.
 configuration, never a cached count. Test: `TestQuorumFollowsConfigurationChanges`,
 `raft/quorum_config_test.go`.
 
-> **Known gap, deliberately open:** membership changes are implemented and tested
-> but not exposed on the wire — no client-facing API drives `AddServer` /
-> `RemoveServer`. Recorded in the README rather than quietly omitted.
+**Now exposed on the wire** — `rpc/admin.go`. `AddServer`, `RemoveServer` and
+`Configuration` are reachable as the `Admin` service, closing what the README
+listed as the top remaining gap.
+
+The service is deliberately thin: every safety rule (leader-only,
+one-change-at-a-time, take-effect-on-append) stays in `raft/membership.go`, and
+re-checking any of it at the RPC layer would duplicate rules in a place that can
+drift out of step with them.
+
+The one thing the wire layer must add is honest outcome reporting, for the same
+reason as §10's `Indeterminate`: a config entry that is appended but not
+committed **may still take effect**. Three distinct answers, because they demand
+different responses —
+
+| Reply | Meaning | Correct response |
+|---|---|---|
+| `OK` | appended and committed | done; `Servers` carries the new configuration |
+| `NotLeader` | nothing appended | retry against `LeaderID` — completely safe |
+| `Indeterminate` | appended, commit unconfirmed | read `Configuration`; do **not** blindly retry |
+
+`Configuration` is answerable by any node, not just the leader — after an
+indeterminate change that is exactly how an operator finds out what happened, and
+requiring a leader would make it unavailable in the one case it exists for.
 
 ---
 

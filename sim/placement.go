@@ -2,10 +2,12 @@ package sim
 
 import (
 	"fmt"
+	"path/filepath"
 
 	"github.com/homura/core-bank/ledger"
 	"github.com/homura/core-bank/raft"
 	"github.com/homura/core-bank/shard"
+	"github.com/homura/core-bank/storage"
 )
 
 // Replica placement across a cluster larger than the replication factor.
@@ -36,6 +38,21 @@ import (
 // the same inputs always produce the same layout, which matters because every
 // node must agree on who holds what without coordinating.
 func NewPlacedCluster(nShards, nNodes, replicationFactor int, seed int64) (*ShardCluster, error) {
+	return NewPlacedClusterWithStorage(nShards, nNodes, replicationFactor, seed, "")
+}
+
+// NewPlacedClusterWithStorage is NewPlacedCluster with optional durability.
+//
+// An empty dir keeps everything in memory, which is what the tests and the
+// default demo want: fast, isolated, and nothing left on disk. A non-empty dir
+// gives every (machine, shard) replica its own WAL and applied-marker file, so
+// the cluster survives the process dying.
+//
+// Files are per REPLICA, not per machine: node-1 hosting shard-0 and shard-1 runs
+// two independent Raft groups with two independent logs, and sharing one file
+// between them would interleave two logs into one and corrupt both on replay.
+// Nodes share nothing — not even in a demo.
+func NewPlacedClusterWithStorage(nShards, nNodes, replicationFactor int, seed int64, dir string) (*ShardCluster, error) {
 	if replicationFactor < 1 {
 		return nil, fmt.Errorf("sim: replication factor must be at least 1")
 	}
@@ -105,6 +122,19 @@ func NewPlacedCluster(nShards, nNodes, replicationFactor int, seed int64) (*Shar
 			// grows, and it is the whole point of a fixed replication factor.
 			srv := raft.NewServerWith(nid, holders, machine,
 				net.ForGroup(sid), cfg, seed+int64(si)*7919+int64(j)*31)
+
+			if dir != "" {
+				// The applied marker is what makes replay possible: without it Restore
+				// loads the log but replays nothing, and the state machine comes back
+				// empty even though the log survived.
+				base := filepath.Join(dir, fmt.Sprintf("%s.%s", nid, sid))
+				applied, err := storage.OpenApplied(base + ".applied")
+				if err != nil {
+					return nil, fmt.Errorf("sim: open applied file for %s/%s: %w", nid, sid, err)
+				}
+				sc.files = append(sc.files, applied)
+				srv.SetStorage(storage.OpenRaftState(base+".wal", applied))
+			}
 
 			net.RegisterGroup(sid, nid, srv)
 			g.Nodes[nid] = srv

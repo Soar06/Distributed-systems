@@ -147,6 +147,7 @@ second port — editing a file in `fe/` and refreshing the page is the whole loo
 | `-ui` | `fe` | directory holding the UI files |
 | `-seed` | 42 | seed for the simulated network (same seed = same layout) |
 | `-seed-accounts` | true | open a few accounts at startup |
+| `-data` | *(empty)* | directory for durable state; empty keeps everything in RAM |
 
 A useful shape for seeing placement rather than co-location — more machines than
 the replication factor, so some machines hold nothing and can fail without any
@@ -155,6 +156,19 @@ account noticing:
 ```bash
 go run ./cmd/demo -shards 2 -nodes 5 -replication-factor 3
 ```
+
+To keep your accounts across restarts:
+
+```bash
+go run ./cmd/demo -data ./demo-data
+```
+
+Every replica gets its own write-ahead log under that directory — one per
+(machine, shard) pair, because a machine hosting two shards runs two independent
+Raft groups and sharing one file between them would interleave two logs into one.
+Kill the process, start it again with the same `-data`, and the balances are
+replayed from those logs. Without `-data` the cluster is pure RAM and starts
+empty every time.
 
 `-nodes` must be at least `-replication-factor`: a shard cannot have more copies
 than there are machines to put them on, and the demo refuses rather than quietly
@@ -351,13 +365,21 @@ in-doubt resolution. 2PC state is durable: a participant that voted YES keeps
 both its promise and the funds it reserved across a full-cluster restart, proven
 by four restart flows rather than asserted.
 
-**Not production-ready.** The significant remaining gaps, in risk order:
+**Not production-ready** — it is a learning project, not a bank. But the gaps
+that were listed here are now closed:
 
-1. **Membership changes are not exposed on the wire.** `AddServer`/`RemoveServer`
-   work and are tested, but no admin RPC calls them, so a running cluster cannot
-   yet be reconfigured from outside.
+- **Membership changes are exposed on the wire.** The `Admin` service carries
+  `AddServer`, `RemoveServer` and `Configuration`, so a running cluster can be
+  reconfigured from outside. It reports the three outcomes separately —
+  committed, rejected (`NotLeader`, nothing appended, safe to retry), and
+  *indeterminate* (appended but commit unconfirmed, so read `Configuration`
+  rather than retrying). Collapsing those is how a cluster gets grown twice.
+- **The demo persists.** `go run ./cmd/demo -data ./demo-data` gives every
+  replica its own WAL, so balances and in-flight 2PC promises survive the
+  process being killed. Without `-data` it stays in memory, which is what the
+  tests and a throwaway demo want.
 
-Everything else on the hardening list is now closed:
+Everything else on the hardening list is closed too:
 
 - **Auth and TLS** — mutual TLS between nodes with the node id bound to the
   certificate subject, plus client bearer tokens.

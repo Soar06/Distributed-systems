@@ -32,6 +32,7 @@ package demo
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"sort"
 	"sync"
 	"time"
@@ -245,6 +246,21 @@ type Cluster struct {
 // New builds a demo cluster: nShards shards spread over nNodes machines, each
 // shard replicated onto exactly replicationFactor of them.
 func New(nShards, nNodes, replicationFactor int, seed int64) (*Cluster, error) {
+	return NewWithStorage(nShards, nNodes, replicationFactor, seed, "")
+}
+
+// NewWithStorage is New with optional durability.
+//
+// An empty dataDir keeps the cluster in memory — fast, isolated, nothing left on
+// disk, which is what tests and a throwaway demo want. A non-empty dataDir gives
+// every replica its own WAL, so balances and in-flight 2PC promises survive the
+// process being killed and restarted.
+//
+// Restoring is deliberately a separate step from constructing: Restore replays
+// each node's log into its state machine BEFORE the servers start, because a
+// node that begins campaigning with an empty log could be elected leader and
+// then overwrite the very entries it was supposed to recover.
+func NewWithStorage(nShards, nNodes, replicationFactor int, seed int64, dataDir string) (*Cluster, error) {
 	// Each shard is placed on exactly `replicationFactor` of the machines.
 	//
 	// Keeping the replication factor FIXED while the machine count grows is what
@@ -253,10 +269,28 @@ func New(nShards, nNodes, replicationFactor int, seed int64) (*Cluster, error) {
 	// machine would make a 9-machine cluster need a quorum of 5, so adding
 	// hardware would make writes slower and less available — the opposite of the
 	// point.
-	sc, err := sim.NewPlacedCluster(nShards, nNodes, replicationFactor, seed)
+	if dataDir != "" {
+		if err := os.MkdirAll(dataDir, 0o755); err != nil {
+			return nil, fmt.Errorf("demo: creating data directory: %w", err)
+		}
+	}
+
+	sc, err := sim.NewPlacedClusterWithStorage(nShards, nNodes, replicationFactor, seed, dataDir)
 	if err != nil {
 		return nil, err
 	}
+
+	// Replay before starting. Restore loads each node's persisted term, vote and
+	// log, then re-applies committed entries into its state machine.
+	restored := false
+	if dataDir != "" {
+		if err := sc.RestoreAll(); err != nil {
+			sc.Stop()
+			return nil, fmt.Errorf("demo: restoring from %s: %w", dataDir, err)
+		}
+		restored = true
+	}
+
 	sc.Start()
 
 	if !sc.WaitForLeaders(5 * time.Second) {
@@ -280,8 +314,18 @@ func New(nShards, nNodes, replicationFactor int, seed int64) (*Cluster, error) {
 	// showing up as a different leader on the next frame (raftwatch.go).
 	go c.watchRaft(120*time.Millisecond, c.driftDone)
 
-	c.logf("cluster started: %d shards across %d machines, replication factor %d",
-		nShards, nNodes, replicationFactor)
+	c.logEvent(Event{
+		Kind: KindControl,
+		Text: fmt.Sprintf("cluster started: %d shards across %d machines, replication factor %d",
+			nShards, nNodes, replicationFactor),
+	})
+	if restored {
+		c.logEvent(Event{
+			Kind: KindControl,
+			Text: fmt.Sprintf("restored from %s — balances and in-flight transactions "+
+				"replayed from each replica's log", dataDir),
+		})
+	}
 	return c, nil
 }
 

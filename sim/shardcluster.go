@@ -2,6 +2,7 @@ package sim
 
 import (
 	"fmt"
+	"io"
 	"sync"
 	"time"
 
@@ -155,6 +156,10 @@ type ShardCluster struct {
 	Groups      map[shard.ID]*ShardGroup
 	Coordinator *shard.Coordinator
 	Nets        map[shard.ID]*Network
+
+	// files holds durable handles opened for this cluster, closed by Stop. Empty
+	// for an in-memory cluster, which is the default.
+	files []io.Closer
 }
 
 // NewShardCluster builds nShards groups of nPerShard nodes each.
@@ -227,6 +232,13 @@ func (sc *ShardCluster) Stop() {
 			g.Nodes[id].Stop()
 		}
 	}
+
+	// Durable handles are closed AFTER the servers, so nothing is still writing
+	// when the file goes away. No-op for an in-memory cluster.
+	for _, f := range sc.files {
+		f.Close()
+	}
+	sc.files = nil
 }
 
 // WaitForLeaders waits until every shard has elected a leader.

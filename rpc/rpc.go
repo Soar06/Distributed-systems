@@ -86,6 +86,13 @@ func ListenSecure(addr string, raftSrv *raft.Server, client *ClientService, tc T
 			return nil, fmt.Errorf("rpc: register bank: %w", err)
 		}
 	}
+
+	// Membership changes (§6). Registered unconditionally: a cluster that cannot
+	// be reconfigured from outside is the gap this closes, and making it optional
+	// would leave the same hole open by default.
+	if err := r.RegisterName("Admin", NewAdminService(raftSrv, 0)); err != nil {
+		return nil, fmt.Errorf("rpc: register admin: %w", err)
+	}
 	return listenOn(addr, r, tc)
 }
 
