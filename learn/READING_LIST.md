@@ -1303,3 +1303,85 @@ inferred by the caller. A silent downgrade of every read would be the opposite.
 **Where it lives in the code:** `raft/read.go` (`ReadIndex`, `LinearizableRead`),
 `demo/demo.go` (`freshestMachine`, `Unreachable`). See [CODE_MAP.md](CODE_MAP.md)
 §10.
+
+## 23. Live resharding: moving key ranges while serving traffic
+
+**What it is.** Changing which shard owns which keys, on a running system, without
+stopping writes and without losing or duplicating any of them. Adding a shard is
+useless if the existing shards keep all the data, so this is what makes "add
+capacity" real rather than a restart.
+
+**What this project has today, and why it is not resharding.** `demo.Resize`
+tears the cluster down and builds a new one. Every account is re-hashed onto a
+fresh ring and re-opened from scratch. That is honest as a teaching control — it
+shows what a different topology looks like — but no data moves, nothing is served
+during the change, and nothing about it is hard. Real resharding is a different
+problem.
+
+**The correctness hazard, and it is the whole problem.**
+
+> During the move, two shards can both believe they own the same key.
+
+The source still has the data; the destination is receiving it. If ownership
+flips before the destination is caught up, reads miss committed writes. If it
+flips after the source stops accepting writes, those writes are lost. If both
+accept writes at once, the two copies diverge and the ledger has two truths.
+
+Raft does not help here: it guarantees agreement WITHIN one group, and a
+resharding move is a handoff BETWEEN two independent groups, each with its own
+log and its own leader. Consensus inside each shard is exactly as strong as
+before and says nothing about which of them is authoritative for a key.
+
+**The invariant that makes it safe.**
+
+> At every instant, for every key, exactly one shard is authoritative — and the
+> transition from one to the other is atomic with respect to any single
+> operation.
+
+Not "eventually one". Not "one after the dust settles". At every instant.
+
+**The standard shape (Spanner, TiKV, CockroachDB, Vitess all follow it):**
+
+1. **Prepare.** Destination shard is created and begins accepting a bulk copy of
+   the range. Source keeps serving everything. Nothing has changed yet from a
+   client's point of view.
+2. **Catch-up.** The destination replays the source's committed entries for that
+   range until the gap is small. This is the long phase, and it happens entirely
+   under normal traffic.
+3. **Freeze the range.** The source stops accepting NEW writes for the moving
+   range only — the rest of its keyspace is untouched. Writes in flight either
+   complete or are rejected as retryable. This window must be short, and it is
+   the only moment availability for those keys is affected.
+4. **Final delta.** Whatever the destination is still missing is shipped.
+5. **Atomic cutover.** Ownership flips on the ring. Both shards must agree the
+   flip happened — this is a distributed decision, so it is 2PC-shaped, with the
+   same in-doubt hazard the money path already has.
+6. **Cleanup.** The source discards the moved range, but only once the cutover is
+   known committed. Discarding on an in-doubt cutover destroys the only surviving
+   copy.
+
+**Why a frozen window is unavoidable in a CP system.** An AP system can let both
+sides accept writes and reconcile later, because it is willing to have two
+truths temporarily. This system is not — READING_LIST §3 and §22. So the choice
+is a brief refusal for the moving range, or a correctness violation, and a bank
+takes the refusal. Making the window short is engineering; removing it entirely
+would require abandoning the guarantee.
+
+**The ring detail that makes this tractable here.** With consistent hashing, a
+shard's territory is not one contiguous arc but ~150 of them (one per virtual
+node). "Move a range" therefore means "reassign some virtual nodes", and the keys
+that move are exactly those hashing into the reassigned arcs. That is a
+significant advantage over range-partitioning: no key comparison, no split point
+to choose, and the moved fraction is predictable from the number of vnodes moved.
+
+**Primary sources**
+- Corbett et al. (2012), *Spanner: Google's Globally-Distributed Database*,
+  §2 (directories as the unit of data movement) and §4 — movement between Paxos
+  groups is what this whole topic is modelled on.
+- Taft et al. (2020), *CockroachDB: The Resilient Geo-Distributed SQL Database*,
+  §2.2 — range splits, merges, and rebalancing under live traffic.
+- DeCandia et al. (2007), *Dynamo*, §4.9 (membership) and §6.2 — adding and
+  removing nodes on a consistent hash ring, and the "hinted handoff" contrast:
+  Dynamo's AP answer to the same window this system refuses.
+- Vitess documentation, *resharding workflow* — the clearest step-by-step
+  description of the freeze/cutover sequence in a system that serves SQL.

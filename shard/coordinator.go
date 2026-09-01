@@ -54,6 +54,16 @@ var (
 	// or a majority outage. It is not an error about the request; it is an honest
 	// "I cannot tell you yet". Retry with the SAME key.
 	ErrCommitUnknown = errors.New("shard: entry appended but commit unconfirmed; retry with the same key")
+
+	// ErrRangeMoving means this key is in a range being resharded and is briefly
+	// frozen for writes. Retryable, and final in the sense that matters: NOTHING
+	// was appended, so unlike ErrCommitUnknown the outcome is not in doubt.
+	//
+	// A typed error rather than a formatted string for the same reason as
+	// ErrNotLeader: the client contract has to tell "come back in a moment" apart
+	// from "this failed". Reporting a frozen range as a failure would make a
+	// planned, brief, correctness-preserving pause look like an outage.
+	ErrRangeMoving = errors.New("shard: this key's range is being moved; retry shortly")
 )
 
 // Group is one shard's Raft group, as the coordinator needs to see it.
@@ -88,6 +98,13 @@ type Coordinator struct {
 
 	// commitTimeout bounds phase 2 delivery.
 	commitTimeout time.Duration
+
+	// migrations tracks in-flight resharding moves (migration.go, §23).
+	//
+	// Consulted on every ownership decision, which is why it is a map lookup under
+	// a read lock rather than a scan: resharding is rare, but the check that keeps
+	// it safe is paid by every operation.
+	migrations *migrationTable
 }
 
 // NewCoordinator builds a coordinator over the given groups.
@@ -98,6 +115,7 @@ func NewCoordinator(ring *Ring, groups map[ID]Group) *Coordinator {
 		clock:          hlc.New(),
 		prepareTimeout: 3 * time.Second,
 		commitTimeout:  3 * time.Second,
+		migrations:     newMigrationTable(),
 	}
 }
 
@@ -109,8 +127,29 @@ func NewCoordinator(ring *Ring, groups map[ID]Group) *Coordinator {
 func (c *Coordinator) Clock() *hlc.Clock { return c.clock }
 
 // ShardFor returns the shard owning an account.
+//
+// THE single ownership decision point, which is what makes live resharding
+// tractable: a migration changes what this returns, and because every operation
+// resolves ownership exactly once here, no operation can see ownership change
+// underneath it (§23).
 func (c *Coordinator) ShardFor(account ledger.AccountID) ID {
-	return c.ring.Lookup(string(account))
+	sid, _ := c.ownerOf(account)
+	return sid
+}
+
+// ownerOf resolves an account's shard and whether writes to it are frozen.
+//
+// The ring gives the STATIC answer — which shard would own this key with no
+// migration in flight. The migration table then overrides it for keys that are
+// actually moving. Keeping the two separate matters: the ring stays a pure
+// function of the key, and only the small set of moving arcs pays any extra
+// thought.
+func (c *Coordinator) ownerOf(account ledger.AccountID) (ID, bool) {
+	base, vnode := c.ring.LookupVNode(string(account))
+	if vnode < 0 {
+		return base, false
+	}
+	return c.migrations.ownerOf(base, vnode)
 }
 
 // Transfer applies a ledger command, choosing single-shard or 2PC as needed.
@@ -135,6 +174,23 @@ func (c *Coordinator) Transfer(txID TxID, cmd ledger.Command) (ledger.Result, er
 	// the timestamp so the retry still returns the original result.
 	if cmd.Timestamp.IsZero() {
 		cmd.Timestamp = c.clock.Now()
+	}
+
+	// Refuse writes to a range that is mid-cutover, BEFORE routing.
+	//
+	// This is the frozen window (§23). It is deliberately a refusal and not a
+	// wait: a write parked until the migration finishes would hold a client
+	// connection for the length of a data move, and a write allowed through would
+	// be stranded on the source after the final delta was computed. Refusing with
+	// a retryable error is the honest answer — and it is scoped to the moving
+	// arcs, so every other key in the same shard keeps committing.
+	for _, acct := range []ledger.AccountID{cmd.From, cmd.To} {
+		if acct == "" {
+			continue
+		}
+		if _, frozen := c.ownerOf(acct); frozen {
+			return ledger.Result{}, fmt.Errorf("%w (account %s)", ErrRangeMoving, acct)
+		}
 	}
 
 	// Route by the account the command actually touches.

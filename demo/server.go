@@ -51,6 +51,7 @@ func Listen(addr, dir string, c *Cluster) (*Server, error) {
 	mux.HandleFunc("/api/heal", s.handleHeal)
 	mux.HandleFunc("/api/underreplicated", s.handleUnderReplicated)
 	mux.HandleFunc("/api/events", s.handleEvents)
+	mux.HandleFunc("/api/reshard", s.handleReshard)
 
 	s.http = &http.Server{
 		Handler: mux,
@@ -360,4 +361,23 @@ func noCache(h http.Handler) http.Handler {
 		w.Header().Set("Expires", "0")
 		h.ServeHTTP(w, r)
 	})
+}
+
+// handleReshard moves one account's ring arc to another shard, live.
+func (s *Server) handleReshard(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	account := ledger.AccountID(q.Get("account"))
+	to := shard.ID(q.Get("to"))
+
+	if account == "" || to == "" {
+		writeJSON(w, map[string]any{"ok": false, "err": "account and to are required"})
+		return
+	}
+
+	st, err := s.cluster.ReshardAccount(account, to)
+	if err != nil {
+		writeJSON(w, map[string]any{"ok": false, "err": err.Error(), "status": st})
+		return
+	}
+	writeJSON(w, map[string]any{"ok": true, "status": st})
 }

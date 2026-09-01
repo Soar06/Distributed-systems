@@ -101,9 +101,15 @@ that quietly drops items loses the record of what was once considered future wor
   read. A stale balance is a wrong balance.
 - **Region-labelled shards** — no notion of region exists anywhere in `shard/` or
   `sim/` yet. Prerequisite for the geographic sharding section above.
-- **Live resharding** — the demo's `Resize` rebuilds the cluster from scratch,
-  which is honest for a teaching control but is not resharding. Moving key ranges
-  between shards while serving traffic is a genuinely harder problem.
+- ~~**Live resharding**~~ — **done**. `shard/migration.go` + `shard/reshard.go`
+  move ring arcs between two running Raft groups while both keep committing:
+  prepare → freeze (moving arcs only) → copy → atomic cutover → drain. Measured
+  frozen window of 11ms for one account, total money conserved. `Resize` remains
+  as the separate teaching control it always was. What is deliberately simplified
+  and said so in the code: the copy happens inside the freeze rather than as a
+  bulk pass plus a small delta, because the demo's datasets make them the same
+  thing. Remaining rough edge: a drained account stays visible on the source with
+  a zero balance, since the ledger has no close-account operation.
 - **Autoscaling replica count** — deliberately still here and deliberately still
   ops rather than theory. Worth keeping written down because it is the field's
   most common misconception: adding replicas to a Raft group does not add write

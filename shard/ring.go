@@ -12,6 +12,7 @@ import (
 	"hash/crc32"
 	"sort"
 	"strconv"
+	"sync"
 )
 
 // ID identifies one shard — one independent Raft group.
@@ -23,6 +24,14 @@ type ID string
 // ownership independently with no coordination. If two nodes disagreed about who
 // owns an account, that would be a correctness bug, not a performance one.
 type Ring struct {
+	// mu guards points and shards.
+	//
+	// The ring was immutable after construction until live resharding made
+	// ownership changeable (§23). Lookup runs on every operation, so this is an
+	// RWMutex: readers never block each other, and the single writer is a
+	// completed cutover.
+	mu sync.RWMutex
+
 	// points are virtual node positions on the ring, sorted by hash.
 	points []point
 
@@ -35,6 +44,15 @@ type Ring struct {
 type point struct {
 	hash  uint32
 	shard ID
+
+	// vnode is which of this shard's virtual nodes this point is (0..vnodes-1).
+	//
+	// Recorded because live resharding moves VIRTUAL NODES, not key ranges: a
+	// shard's territory is ~150 separate arcs, and naming the arc is what lets a
+	// migration say precisely which keys are moving (migration.go, §23). Without
+	// it the only way to describe a moving subset would be a hash range, which
+	// would then have to be re-derived on every lookup.
+	vnode int
 }
 
 // DefaultVNodes is the number of virtual nodes per shard.
@@ -57,6 +75,7 @@ func NewRing(shards []ID, vnodes int) *Ring {
 			r.points = append(r.points, point{
 				hash:  hashKey(string(s) + "#" + strconv.Itoa(i)),
 				shard: s,
+				vnode: i,
 			})
 		}
 	}
@@ -91,6 +110,9 @@ type Segment struct {
 // its END: a key is owned by the first shard clockwise from its hash, so the arc
 // leading up to a virtual node is that node's territory.
 func (r *Ring) Segments() []Segment {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
 	if len(r.points) == 0 {
 		return nil
 	}
@@ -123,8 +145,22 @@ func HashKey(s string) uint32 { return hashKey(s) }
 
 // Lookup returns the shard owning key: the first shard clockwise from hash(key).
 func (r *Ring) Lookup(key string) ID {
+	s, _ := r.LookupVNode(key)
+	return s
+}
+
+// LookupVNode returns the shard owning a key AND which of that shard's virtual
+// nodes owns it.
+//
+// The vnode index is what live resharding moves (migration.go): it names one arc
+// of the ring precisely, so a migration can say exactly which keys are in flight
+// without re-deriving a hash range on every lookup.
+func (r *Ring) LookupVNode(key string) (ID, int) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
 	if len(r.points) == 0 {
-		return ""
+		return "", -1
 	}
 	h := hashKey(key)
 
@@ -133,11 +169,14 @@ func (r *Ring) Lookup(key string) ID {
 	if i == len(r.points) {
 		i = 0 // wrapped past the end of the ring
 	}
-	return r.points[i].shard
+	return r.points[i].shard, r.points[i].vnode
 }
 
 // Shards returns the shards in the ring.
 func (r *Ring) Shards() []ID {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
 	return append([]ID(nil), r.shards...)
 }
 
@@ -145,8 +184,14 @@ func (r *Ring) Shards() []ID {
 // tests to verify virtual nodes actually balance the ring, and by the dashboard's
 // ring view.
 func (r *Ring) Distribution(keys []string) map[ID]int {
-	out := make(map[ID]int, len(r.shards))
-	for _, s := range r.shards {
+	// Snapshot the shard list under the lock, then release it before calling
+	// Lookup — Lookup takes the read lock itself via LookupVNode, and although an
+	// RWMutex permits recursive read locks, relying on that deadlocks the moment a
+	// writer queues between the two acquisitions.
+	shards := r.Shards()
+
+	out := make(map[ID]int, len(shards))
+	for _, s := range shards {
 		out[s] = 0
 	}
 	for _, k := range keys {
@@ -160,6 +205,9 @@ func (r *Ring) Points() []struct {
 	Hash  uint32
 	Shard ID
 } {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
 	out := make([]struct {
 		Hash  uint32
 		Shard ID
@@ -172,6 +220,55 @@ func (r *Ring) Points() []struct {
 
 // String renders the ring for debugging.
 func (r *Ring) String() string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
 	return fmt.Sprintf("Ring(%d shards, %d vnodes each, %d points)",
 		len(r.shards), r.vnodes, len(r.points))
+}
+
+// Reassign permanently moves virtual nodes of one shard to another.
+//
+// Called at the END of a live reshard, once the cutover is committed (§23).
+//
+// Why the ring itself must change, and not just the migration table: the table is
+// transient state describing a move IN FLIGHT, and a completed cutover is
+// permanent. Leaving the new ownership recorded only in the table meant that
+// finishing the migration handed the keys straight back to the source — the
+// cutover undid itself the instant it completed, which is precisely the bug the
+// routing test caught.
+//
+// Takes the write lock because Lookup runs on every operation; the reassignment
+// is a handful of point updates and a re-sort, and it happens once per migration.
+func (r *Ring) Reassign(from, to ID, vnodes []int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	want := make(map[int]bool, len(vnodes))
+	for _, v := range vnodes {
+		want[v] = true
+	}
+
+	for i := range r.points {
+		if r.points[i].shard == from && want[r.points[i].vnode] {
+			r.points[i].shard = to
+		}
+	}
+
+	// The hash of each point is unchanged — only its owner — so the sort order is
+	// already correct and no re-sort is needed. Recording that explicitly because
+	// the natural assumption is the opposite.
+
+	if !containsShard(r.shards, to) {
+		r.shards = append(r.shards, to)
+	}
+}
+
+func containsShard(ids []ID, want ID) bool {
+	for _, id := range ids {
+		if id == want {
+			return true
+		}
+	}
+	return false
 }

@@ -438,3 +438,58 @@ Contact must mean *a successful exchange*, not *a returned struct*.
    appended but not committed is indeterminate; calling it a failure invites a
    retry under a new key, which double-applies. The user saw this in the UI
    before any test did — and was right when the model asserted otherwise.
+
+---
+
+## 13. Live resharding — moving keys between shards under traffic
+
+`shard/migration.go` (state machine + ownership rule), `shard/reshard.go` (the
+driver), `shard/ring.go:Reassign` (the permanent flip). Theory: READING_LIST §23.
+
+**Not in the paper.** Raft guarantees agreement *within* one group; a reshard is a
+handoff *between* two independent groups, each with its own log and leader.
+Consensus inside each shard is exactly as strong as before and says nothing about
+which of them is authoritative for a key. Modelled on Spanner's directory moves
+and CockroachDB's range rebalancing.
+
+**The invariant:**
+
+> At every instant, for every key, exactly one shard is authoritative — and the
+> transition is atomic with respect to any single operation.
+
+`Coordinator.ShardFor` is the single ownership decision point, which is what makes
+this tractable: every operation resolves ownership exactly once, so none can see
+it change underneath.
+
+**The phases, and why the order is the algorithm:**
+
+| Phase | State | Why here |
+|---|---|---|
+| `MigPreparing` | source authoritative, still writable | destination not yet allowed to answer |
+| `MigFrozen` | source authoritative, **writes refused** | a write admitted after the delta is computed would be stranded |
+| `MigCutover` | destination authoritative | ring reassigned — the flip is permanent |
+| `MigDone` | source copy drained | safe *only* once cutover committed |
+
+**Why the frozen window exists at all.** An AP system lets both sides write and
+reconciles later, accepting two truths temporarily. This system is CP (§3, §22),
+so the choice is a brief refusal or a correctness violation. Scoped to the moving
+arcs only — every other key in both shards keeps committing. Measured at **11ms**
+for a single account.
+
+**Two bugs worth remembering, both caught by tests:**
+
+1. **The cutover undid itself.** Ownership was recorded only in the migration
+   table, which is torn down when the migration finishes — so completing the move
+   handed the keys straight back to the source. Fixed by `Ring.Reassign`: the
+   table covers the window while the answer is *changing*; the ring is the durable
+   answer. Confirmed load-bearing by removing the call and watching the routing
+   test fail.
+2. **The ring became mutable.** It was immutable after construction, so nothing
+   guarded it. Live reassignment made it a shared mutable structure read on every
+   operation — now an `RWMutex`, with `Distribution` snapshotting the shard list
+   *before* calling `Lookup` rather than relying on recursive read locks, which
+   deadlock the moment a writer queues between the two acquisitions.
+
+**`ErrRangeMoving`** is a typed error for the same reason as `ErrNotLeader`: it
+means "come back in a moment", and nothing was appended, so unlike
+`ErrCommitUnknown` the outcome is *not* in doubt.
