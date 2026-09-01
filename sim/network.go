@@ -33,6 +33,7 @@ import (
 	"time"
 
 	"github.com/homura/core-bank/raft"
+	"github.com/homura/core-bank/shard"
 )
 
 // Network is an in-memory raft.Transport that can inject faults.
@@ -44,6 +45,12 @@ type Network struct {
 	mu sync.Mutex
 
 	nodes map[raft.NodeID]*raft.Server
+
+	// groups holds servers for a CO-LOCATED cluster, where one machine hosts a
+	// replica of several shards (network_groups.go). Keyed by shard then node,
+	// while crash/partition state stays keyed by MACHINE — a machine is reachable
+	// or it is not, and when it dies every group it hosts loses that replica.
+	groups map[shard.ID]map[raft.NodeID]*raft.Server
 
 	// crashed nodes accept no RPCs and send none: a stopped process.
 	crashed map[raft.NodeID]bool
@@ -136,9 +143,19 @@ func (n *Network) deliverable(from, to raft.NodeID) (*raft.Server, bool, bool, t
 		return nil, false, false, 0
 	}
 
-	target, ok := n.nodes[to]
-	if !ok {
+	// A co-located cluster registers through RegisterGroup, so the node-level map
+	// is empty and the caller resolves the server itself (network_groups.go).
+	// Reachability — crash, partition, drop, latency — has already been decided
+	// above and is keyed by MACHINE either way, which is the property that makes
+	// killing a machine take down every group it hosts.
+	target := n.nodes[to]
+	if target == nil && len(n.groups) == 0 {
 		return nil, false, false, 0
+	}
+	if target == nil {
+		if _, known := n.partitions[to]; !known {
+			return nil, false, false, 0
+		}
 	}
 
 	dup := n.duplicateRate > 0 && rnd.Float64() < n.duplicateRate

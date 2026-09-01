@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/homura/core-bank/hlc"
 	"github.com/homura/core-bank/ledger"
 	"github.com/homura/core-bank/raft"
 )
@@ -224,9 +225,10 @@ func (m *Machine) applyOutcome(cmd Command) any {
 	var res ledger.Result
 	if cmd.Commit {
 		if rec.Debit {
-			res = m.State.CommitDebit(string(cmd.TxID))
+			res = m.State.CommitDebit(string(cmd.TxID), outcomeTimestamp(cmd, rec))
 		} else {
-			res = m.State.CommitCredit(string(cmd.TxID), rec.Cmd.To, rec.Cmd.Amount)
+			res = m.State.CommitCredit(string(cmd.TxID), rec.Cmd.To, rec.Cmd.Amount,
+				outcomeTimestamp(cmd, rec))
 		}
 		rec.Phase = PhaseCommitted
 	} else {
@@ -236,6 +238,20 @@ func (m *Machine) applyOutcome(cmd Command) any {
 	rec.Decided = true
 	rec.Commit = cmd.Commit
 	return res
+}
+
+// outcomeTimestamp picks the HLC timestamp to book a 2PC leg under.
+//
+// The outcome command's own timestamp when it has one, falling back to the
+// timestamp recorded at prepare time. The fallback matters for recovery: an
+// outcome re-delivered by RecoverInDoubt is constructed from the stored record,
+// and booking it at "no time" would leave exactly the transactions that needed
+// recovery as the ones missing from the ordering.
+func outcomeTimestamp(cmd Command, rec *TxRecord) hlc.Timestamp {
+	if !cmd.Ledger.Timestamp.IsZero() {
+		return cmd.Ledger.Timestamp
+	}
+	return rec.Cmd.Timestamp
 }
 
 // Tx returns the durable record for a transaction.

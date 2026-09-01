@@ -21,11 +21,7 @@ func NewClusterWithStorage(t *testing.T, n int, seed int64, dir string) *Cluster
 	t.Helper()
 
 	net := NewNetwork(seed)
-	cfg := raft.Config{
-		ElectionTimeoutMin: 60,
-		ElectionTimeoutMax: 120,
-		HeartbeatInterval:  15,
-	}
+	cfg := simConfig()
 
 	ids := make([]raft.NodeID, n)
 	for i := range n {

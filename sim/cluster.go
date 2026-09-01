@@ -43,7 +43,12 @@ func (c *CountingSM) Apply(cmd []byte) any {
 }
 
 // Snapshot returns a copy of what has been applied.
-func (c *CountingSM) Snapshot() []string {
+//
+// NOTE the name collision this deliberately does not have: raft.Snapshotter
+// requires Snapshot() ([]byte, error), which this signature would shadow. The
+// serialized form is TakeSnapshot/RestoreSnapshot below, so CountingSM can
+// satisfy raft.Snapshotter while tests keep the convenient []string view.
+func (c *CountingSM) AppliedCopy() []string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	out := make([]string, len(c.Applied))
@@ -57,11 +62,7 @@ func (c *CountingSM) Snapshot() []string {
 func NewCluster(n int, seed int64) *Cluster {
 	net := NewNetwork(seed)
 
-	cfg := raft.Config{
-		ElectionTimeoutMin: 60,
-		ElectionTimeoutMax: 120,
-		HeartbeatInterval:  15,
-	}
+	cfg := simConfig()
 
 	ids := make([]raft.NodeID, n)
 	for i := range n {
@@ -143,7 +144,7 @@ func (c *Cluster) WaitForCommit(n int, timeout time.Duration, ids ...raft.NodeID
 	for time.Now().Before(deadline) {
 		ok := true
 		for _, id := range ids {
-			if len(c.SMs[id].Snapshot()) < n {
+			if len(c.SMs[id].AppliedCopy()) < n {
 				ok = false
 				break
 			}
@@ -160,7 +161,7 @@ func (c *Cluster) WaitForCommit(n int, timeout time.Duration, ids ...raft.NodeID
 // Safety can be checked across time rather than only at the end.
 func (c *Cluster) RecordHistory() {
 	for _, id := range c.IDs {
-		applied := c.SMs[id].Snapshot()
+		applied := c.SMs[id].AppliedCopy()
 		if len(applied) > len(c.history[id]) {
 			c.history[id] = applied
 		}
@@ -190,29 +191,73 @@ func (c *Cluster) CheckElectionSafety() error {
 // term, then the logs are identical in all entries up through the given index"
 // (§5.3).
 func (c *Cluster) CheckLogMatching() error {
-	logs := make(map[raft.NodeID][]raft.LogEntry)
+	// Indexed by LOG INDEX, not by slice position.
+	//
+	// Those coincided before compaction existed, and this check used to walk the
+	// slices in parallel. Once a node compacts, its slice starts at the snapshot
+	// boundary rather than at index 0, so position k means a different entry on
+	// each node — and comparing them reported a Log Matching violation that was
+	// purely an artifact of the checker. The property is stated over log indices,
+	// so the check must be too.
+	byIndex := make(map[raft.NodeID]map[raft.Index]raft.LogEntry, len(c.IDs))
 	for _, id := range c.IDs {
-		logs[id] = c.Nodes[id].LogEntries()
+		m := make(map[raft.Index]raft.LogEntry)
+		entries := c.Nodes[id].LogEntries()
+		for i, e := range entries {
+			// entries[0] is the SENTINEL, and it is not a real log entry.
+			//
+			// Uncompacted it sits at index 0 with a zero term. After compaction it
+			// carries the snapshot boundary — a real index and term, but still no
+			// command, because it stands in for an entry whose content now lives in
+			// the snapshot. Comparing it against the real entry another node still
+			// holds at that index reports a difference that is not one: "" versus
+			// "part-23" at index 25, both term 1.
+			//
+			// Skipping by position rather than by index is what makes this correct
+			// for both cases.
+			if i == 0 {
+				continue
+			}
+			m[e.Index] = e
+		}
+		byIndex[id] = m
 	}
 
 	for i, a := range c.IDs {
 		for _, b := range c.IDs[i+1:] {
-			la, lb := logs[a], logs[b]
-			limit := min(len(la), len(lb))
-			for k := limit - 1; k >= 0; k-- {
-				if la[k].Term != lb[k].Term {
+			la, lb := byIndex[a], byIndex[b]
+
+			// Find the highest index both hold with the same term. Everything at or
+			// below it must be identical on both.
+			var agreeAt raft.Index
+			var agreeTerm raft.Term
+			for idx, ea := range la {
+				eb, ok := lb[idx]
+				if !ok || ea.Term != eb.Term {
 					continue
 				}
-				// Same index and term: everything before must match too.
-				for j := 0; j <= k; j++ {
-					if la[j].Term != lb[j].Term || string(la[j].Command) != string(lb[j].Command) {
-						return fmt.Errorf(
-							"Log Matching violated: %s and %s agree at index %d (term %d) but differ at index %d (%q/t%d vs %q/t%d)",
-							a, b, la[k].Index, la[k].Term, la[j].Index,
-							la[j].Command, la[j].Term, lb[j].Command, lb[j].Term)
-					}
+				if idx > agreeAt {
+					agreeAt, agreeTerm = idx, ea.Term
 				}
-				break
+			}
+			if agreeAt == 0 {
+				continue // no common entry; nothing the property constrains
+			}
+
+			for idx := raft.Index(1); idx <= agreeAt; idx++ {
+				ea, okA := la[idx]
+				eb, okB := lb[idx]
+				// An entry missing from one log is compacted away, not divergent:
+				// a snapshot only ever covers committed entries.
+				if !okA || !okB {
+					continue
+				}
+				if ea.Term != eb.Term || string(ea.Command) != string(eb.Command) {
+					return fmt.Errorf(
+						"Log Matching violated: %s and %s agree at index %d (term %d) but differ at index %d (%q/t%d vs %q/t%d)",
+						a, b, agreeAt, agreeTerm, idx,
+						ea.Command, ea.Term, eb.Command, eb.Term)
+				}
 			}
 		}
 	}
@@ -263,7 +308,25 @@ func (c *Cluster) CheckLeaderCompleteness() error {
 	for id := range leaders {
 		leaderID = id
 	}
-	leaderLog := c.Nodes[leaderID].LogEntries()
+	// Indexed by log index rather than slice position, for the same reason as
+	// CheckLogMatching: a compacted log does not start at index 0.
+	leaderByIndex := make(map[raft.Index]raft.LogEntry)
+	var leaderLast raft.Index
+	leaderEntries := c.Nodes[leaderID].LogEntries()
+	for i, e := range leaderEntries {
+		if i == 0 {
+			continue // sentinel, see CheckLogMatching
+		}
+		leaderByIndex[e.Index] = e
+		if e.Index > leaderLast {
+			leaderLast = e.Index
+		}
+	}
+	// A compacted leader's log ends at its last real entry, but everything at or
+	// below its snapshot boundary is still present — in the snapshot. Treating the
+	// boundary as the floor keeps "the leader is missing a committed entry" from
+	// firing on entries the leader deliberately discarded.
+	leaderBase := leaderEntries[0].Index
 
 	for _, id := range c.IDs {
 		if id == leaderID {
@@ -271,18 +334,33 @@ func (c *Cluster) CheckLeaderCompleteness() error {
 		}
 		s := c.Nodes[id]
 		committed := s.CommitIndex()
-		nodeLog := s.LogEntries()
 
-		for idx := raft.Index(1); idx <= committed && int(idx) < len(nodeLog); idx++ {
-			if int(idx) >= len(leaderLog) {
-				return fmt.Errorf(
-					"Leader Completeness violated: %s committed index %d but leader %s's log ends at %d",
-					id, idx, leaderID, len(leaderLog)-1)
+		nodeEntries := s.LogEntries()
+		for i, e := range nodeEntries {
+			if i == 0 || e.Index > committed {
+				continue // sentinel, or not yet committed here
 			}
-			if string(nodeLog[idx].Command) != string(leaderLog[idx].Command) {
+			if e.Index <= leaderBase {
+				continue // covered by the leader's snapshot
+			}
+			le, ok := leaderByIndex[e.Index]
+			if !ok {
+				// Absent from the leader's log because the leader compacted past it,
+				// not because it was lost: a snapshot only covers committed entries,
+				// and Leader Completeness is about entries surviving, not about them
+				// staying in uncompacted form. A genuinely missing entry shows up as
+				// the leader's log ending BELOW the committed index.
+				if e.Index > leaderLast {
+					return fmt.Errorf(
+						"Leader Completeness violated: %s committed index %d but leader %s's log ends at %d",
+						id, e.Index, leaderID, leaderLast)
+				}
+				continue
+			}
+			if string(e.Command) != string(le.Command) {
 				return fmt.Errorf(
 					"Leader Completeness violated: committed entry %d is %q on %s but %q on leader %s",
-					idx, nodeLog[idx].Command, id, leaderLog[idx].Command, leaderID)
+					e.Index, e.Command, id, le.Command, leaderID)
 			}
 		}
 	}

@@ -105,16 +105,18 @@ func TestClusterSurvivesFullRestart(t *testing.T) {
 	c := NewClusterWithStorage(t, 3, 42, dir)
 	c.Start()
 
-	leader, ok := c.WaitForLeader(3 * time.Second)
-	if !ok {
+	if _, ok := c.WaitForLeader(3 * time.Second); !ok {
 		t.Fatalf("no leader elected%s", c.View())
 	}
+	// Submitted through leadership changes rather than to one node found earlier:
+	// an election between finding the leader and submitting is legitimate Raft
+	// behaviour, and under load it happens often enough to matter.
 	for _, cmd := range []string{"tx1", "tx2", "tx3"} {
-		if _, _, ok := c.Nodes[leader].Submit([]byte(cmd)); !ok {
-			t.Fatalf("leader rejected %s", cmd)
+		if _, ok := c.SubmitWithRetry(t, []byte(cmd), 5*time.Second); !ok {
+			t.Fatalf("could not submit %s to any leader%s", cmd, c.View())
 		}
 	}
-	if !c.WaitForCommit(3, 3*time.Second) {
+	if !c.WaitForCommit(3, 5*time.Second) {
 		t.Fatalf("initial commit failed%s%s", c.View(), c.View().LogsString())
 	}
 	c.Stop()

@@ -158,8 +158,11 @@ core-bank/
 
 ## Status
 
-**Phase 1 complete. Phase 2 core protocol complete** (2026-08-29). 101 tests under
-`-race`; Go 1.27. Production-hardening pass in progress.
+**Phase 1 complete. Phase 2 COMPLETE** (2026-08-30). 286 tests under `-race`;
+Go 1.27. 2PC state proven durable across a restart; sharding now runs as real
+multi-process clusters over authenticated TLS, and adds write capacity as
+predicted. Production hardening continues: snapshotting, observability, membership
+changes, and backpressure remain (G3, G5-G7 in DESIGN.md).
 
 - [x] **Phase 1** — consensus core, persistence, ledger, real separate processes over
       TCP, linearizable reads, chaos harness with all five Figure 3 safety properties.
@@ -170,15 +173,24 @@ core-bank/
       shape: prepare/decision/outcome all replicated log entries, coordinator crash
       recovery, in-doubt resolution, fund reservation. Money conservation asserted
       after every transfer.
-- [ ] **Phase 2 remainder** — multi-process sharded deployment; the sharded throughput
-      benchmark (not measurable in-process, see [DESIGN.md](DESIGN.md)); persistence
-      for 2PC state (a prepared participant currently forgets its promise on restart).
+- [x] **Phase 2 remainder — complete (2026-08-30).** Multi-process sharded deployment
+      (`cmd/shardnode`, shard-multiplexed RPC) and the sharded throughput benchmark:
+      with dedicated nodes per shard, 2 shards reach ~2.0x and 4 shards ~3.3-4.6x of
+      one shard's write throughput. 2PC-state persistence is proven by four restart
+      flows in `sim/twopc_persist_test.go`.
 - [ ] **Production hardening** — findings from a multi-agent review of raft/storage,
-      ledger/shard, and rpc/node are being worked through. Tracked in DESIGN.md.
-- [ ] **Phase 3** — HLC. Idempotency, double-entry, and event sourcing were built
-      early, during Phases 1-2.
-- [ ] **Phase 4 UIs** — `fe/` remains static mockups on fake data. The backend now
-      exposes what they need (`Bank.Status` per node), and the concurrent
-      same-account question is settled and proven: the ledger serializes withdrawals
-      through the log, so exactly the available funds can be withdrawn and the
-      balance never goes negative.
+      ledger/shard, and rpc/node are being worked through. Tracked in DESIGN.md,
+      where every remaining gap now has a design and a sequenced order (G0-G7):
+      auth/TLS with the sharded wire-format change, then multi-process sharding,
+      the throughput benchmark, snapshotting, observability, membership changes,
+      and backpressure.
+- [x] **Phase 3 — complete.** HLC gives cross-shard event ordering: a leader stamps
+      each command before it is appended, every replica applies the same timestamp,
+      and both legs of a cross-shard transfer share one. Idempotency, double-entry,
+      and event sourcing were built early, during Phases 1-2.
+- [x] **Phase 4 — complete.** Both UIs drive a real cluster via `cmd/demo`: live
+      state over Server-Sent Events, and controls to move money, kill nodes, revive
+      them, and run 2PC recovery. The two deliberately-open questions are settled and
+      displayed as the backend actually behaves — the ledger serializes concurrent
+      withdrawals through the log, so the balance never goes negative and the loser
+      gets `insufficient funds`.

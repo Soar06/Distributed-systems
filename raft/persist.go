@@ -216,6 +216,13 @@ func (s *Server) Restore() error {
 	s.log = log
 	s.role = Follower
 
+	// Membership is derived from the log, so a restarting server re-learns it the
+	// same way it re-learns everything else. Without this a node would come back
+	// with the configuration it was STARTED with — the one in its flags — and a
+	// cluster that had since added or removed a server would have one member
+	// counting quorum against a membership that no longer exists.
+	s.adoptConfigFromLogLocked()
+
 	// Figure 2: commitIndex and lastApplied are volatile and restart at 0. The
 	// node re-learns its commit index from the leader.
 	s.commitIndex = 0
@@ -230,12 +237,66 @@ func (s *Server) Restore() error {
 	// deterministic. Without it, a restarted node's ledger and its 2PC promises
 	// start empty: a participant that voted YES would forget it, and the funds it
 	// reserved would become spendable again while the transaction is still live.
+	// Load the snapshot FIRST, before any replay.
+	//
+	// A compacted node's log no longer contains the entries before the snapshot
+	// boundary, so replaying the log alone would rebuild the state machine from a
+	// partial history — balances short by everything the snapshot covers, and 2PC
+	// promises missing entirely. The snapshot is the base; the log is the delta.
+	if ss, ok := s.storage.(SnapshotStorage); ok && s.sm != nil {
+		idx, term, data, found, err := ss.LoadSnapshot()
+		if err != nil {
+			return err
+		}
+		if found {
+			snapper, canRestore := s.sm.(Snapshotter)
+			if !canRestore {
+				// The log prefix is gone and this state machine cannot consume the
+				// snapshot that replaced it. Booting anyway would serve reads from a
+				// state machine missing everything before the boundary, which is worse
+				// than not booting.
+				return fmt.Errorf("raft: a snapshot at index %d exists but the state "+
+					"machine cannot restore it; the compacted log prefix is unrecoverable", idx)
+			}
+			if err := snapper.RestoreSnapshot(data); err != nil {
+				return fmt.Errorf("raft: restore snapshot at index %d: %w", idx, err)
+			}
+			s.snapshot = &snapshotState{
+				lastIncludedIndex: Index(idx),
+				lastIncludedTerm:  Term(term),
+				data:              data,
+			}
+			// The state machine now reflects everything through the boundary, so
+			// replay must start after it rather than from index 1.
+			s.commitIndex = Index(idx)
+			s.lastApplied = Index(idx)
+
+			// A log that predates its own snapshot cannot happen if writes are
+			// ordered (snapshot first, then the truncated log), but a torn or rolled
+			// back state file could produce it. Rebase onto the snapshot rather than
+			// replaying entries the snapshot already covers.
+			if len(s.log) > 0 && s.log[0].Index < Index(idx) {
+				if e, ok := s.entryAt(Index(idx)); ok && e.Term == Term(term) {
+					s.discardThrough(Index(idx), Term(term))
+				} else {
+					s.log = []LogEntry{{Term: Term(term), Index: Index(idx)}}
+				}
+			}
+		}
+	}
+
 	if as, ok := s.storage.(AppliedStorage); ok && s.sm != nil {
 		raw, err := as.LoadApplied()
 		if err != nil {
 			return err
 		}
 		prevApplied := Index(raw)
+		if prevApplied < s.baseIndex() {
+			// The marker predates the snapshot, which is normal: the snapshot itself
+			// advanced the applied point. The restored state machine is already at
+			// the boundary, so there is nothing to replay.
+			prevApplied = s.baseIndex()
+		}
 		if prevApplied > s.lastIndex() {
 			// The applied marker is ahead of the log. This is NOT impossible, and an
 			// earlier version of this code wrongly refused to start because of it:
@@ -249,7 +310,10 @@ func (s *Server) Restore() error {
 			// already applies to a corrupt record.
 			prevApplied = s.lastIndex()
 		}
-		for i := Index(1); i <= prevApplied; i++ {
+		// Replay starts after the snapshot boundary. Entries at or below it are
+		// already reflected in the restored state machine, and re-applying them
+		// would double-count every one.
+		for i := s.baseIndex() + 1; i <= prevApplied; i++ {
 			e, ok := s.entryAt(i)
 			if !ok {
 				return fmt.Errorf("raft: missing log entry %d during replay", i)
@@ -263,8 +327,12 @@ func (s *Server) Restore() error {
 				s.sm.Apply(e.Command)
 			}
 		}
-		s.commitIndex = prevApplied
-		s.lastApplied = prevApplied
+		if prevApplied > s.commitIndex {
+			s.commitIndex = prevApplied
+		}
+		if prevApplied > s.lastApplied {
+			s.lastApplied = prevApplied
+		}
 	}
 	return nil
 }

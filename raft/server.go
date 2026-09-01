@@ -78,6 +78,49 @@ type Server struct {
 	// recent error. Not fatal (replay is idempotent), but not silent either.
 	appliedErrs    int
 	lastAppliedErr error
+
+	// snapshot is the compacted log prefix (§7), nil until the first compaction.
+	snapshot *snapshotState
+
+	// snapshotErrs counts snapshot failures, with the most recent error. Like the
+	// applied marker these are not fatal — the log is still authoritative — but a
+	// node that cannot snapshot will eventually hit the wall compaction exists to
+	// prevent, so it must be visible rather than silent.
+	snapshotErrs    int
+	lastSnapshotErr error
+
+	// health biases how eagerly this server campaigns (health_priority.go). It
+	// changes WHO TRIES FIRST, never who is allowed to win — the up-to-date check
+	// in RequestVote is untouched.
+	health healthAtomic
+
+	// lastLeaderContact is when a leader last reached this server, for the
+	// disruptive-server check (membership.go).
+	lastLeaderContact time.Time
+
+	// configChangeIndex is the log index of the newest configuration entry, or 0.
+	// A change is in flight while this exceeds commitIndex, and only one may be in
+	// flight at a time (membership.go).
+	configChangeIndex Index
+
+	// removedFromCluster latches when a committed configuration removed this
+	// server, so a leader steps down exactly once.
+	removedFromCluster bool
+
+	// configErrs counts malformed configuration entries, with the most recent
+	// error. Membership being wrong is a safety problem rather than an
+	// availability one, so it is counted rather than silently skipped.
+	configErrs    int
+	lastConfigErr error
+
+	// lastContact records when each peer last replied successfully, so a LEADER
+	// can tell whether it still sees a majority (G5, health.go).
+	//
+	// Needed because leadership is not the same as quorum: a partitioned leader
+	// keeps its role and its term until it hears otherwise, so "am I the leader?"
+	// answers yes while "can I commit?" answers no. Only the second question
+	// matters to a client, and only this map can answer it without a round trip.
+	lastContact map[NodeID]time.Time
 }
 
 // WaitApplied returns a channel closed once the entry at idx has been applied.
@@ -266,6 +309,10 @@ func (s *Server) AppendEntries(args AppendEntriesArgs) AppendEntriesReply {
 
 	// Remember who the leader is so clients can be redirected.
 	s.leaderID = args.LeaderID
+	// Timestamped for the disruptive-server check in RequestVote: it needs to know
+	// whether a leader is currently reaching us, not merely whether we remember
+	// one from some time ago.
+	s.lastLeaderContact = time.Now()
 
 	// A valid leader is alive, so do not challenge it: reset the election timer
 	// (Figure 2, "Followers"). This happens even if the log check below fails —
@@ -285,6 +332,15 @@ func (s *Server) AppendEntries(args AppendEntriesArgs) AppendEntriesReply {
 
 	// Rules 3 and 4.
 	changed := s.appendFrom(args.PrevLogIndex, args.Entries)
+
+	// A follower learns about membership changes the same way it learns about
+	// everything else: they arrive as log entries. Adopted on APPEND, before the
+	// entry commits (§6) — a follower voting under the old configuration while the
+	// leader counts under the new one is the disjoint-majority hazard the whole
+	// design exists to prevent.
+	if changed {
+		s.adoptConfigFromLogLocked()
+	}
 
 	// Figure 2: persistent state must be durable BEFORE we reply. A follower that
 	// acknowledges entries it has not durably stored can lose them on restart
@@ -322,6 +378,30 @@ func (s *Server) RequestVote(args RequestVoteArgs) RequestVoteReply {
 
 	// Rule 1.
 	if args.Term < s.currentTerm {
+		return RequestVoteReply{Term: s.currentTerm, VoteGranted: false}
+	}
+
+	// The disruptive-server check (dissertation §4.2.3), and it MUST come before
+	// observeTerm.
+	//
+	// A server removed from the configuration stops receiving heartbeats, times
+	// out, increments its term, and campaigns. Its higher term forces the real
+	// leader to step down even though the caller is not a member any more — so a
+	// departed node can depose a healthy leader indefinitely, and the cluster
+	// never settles.
+	//
+	// The answer is to ignore RequestVote received within the minimum election
+	// timeout of hearing from a current leader: if a leader is alive and reaching
+	// us, no election is warranted, whoever is asking. Placed before observeTerm
+	// because adopting the term is itself the damage — a vote refused after the
+	// term has already been adopted has still deposed the leader.
+	//
+	// This is deliberately NOT gated on "is the caller in our configuration". A
+	// server that has legitimately fallen out of contact must still be able to
+	// campaign once the leader really is gone, and by then the heartbeat window
+	// will have lapsed.
+	if s.leaderID != "" && s.role == Follower &&
+		time.Since(s.lastLeaderContact) < s.minElectionTimeout() {
 		return RequestVoteReply{Term: s.currentTerm, VoteGranted: false}
 	}
 

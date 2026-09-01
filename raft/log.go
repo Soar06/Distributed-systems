@@ -6,28 +6,67 @@ package raft
 // log state: they are the pieces most directly checkable against the paper, and
 // the ones the Figure 3 safety properties are stated in terms of.
 
-// lastIndex returns the index of the last entry in the log, or 0 if the log
-// holds only the sentinel.
+// Log indexing with a compacted prefix (§7).
+//
+// s.log[0] is a sentinel. Before compaction it is the zero entry at index 0, so
+// log index and slice position coincide. AFTER compaction the sentinel becomes
+// the snapshot boundary: it carries lastIncludedIndex/lastIncludedTerm, the
+// entries before it are gone, and index no longer equals slice position.
+//
+// Every translation between the two goes through these helpers. That was already
+// the design intent — the old entryAt carried a comment saying the assumption
+// "breaks when snapshotting arrives and is deliberately localized here" — so this
+// is the localization being cashed in rather than a new one being invented.
+
+// baseIndex is the index of the sentinel: 0 normally, or lastIncludedIndex once
+// the log has been compacted. Entries at or below it are no longer in the log.
+func (s *Server) baseIndex() Index {
+	return s.log[0].Index
+}
+
+// baseTerm is the term of the sentinel — lastIncludedTerm after compaction.
+//
+// This is what lets AppendEntries still answer a prevLogTerm check for the entry
+// immediately before the snapshot. Without it the log would be unmatched at its
+// own boundary and replication would stall permanently.
+func (s *Server) baseTerm() Term {
+	return s.log[0].Term
+}
+
+// slot converts a log index to a slice position. The caller must have checked
+// the index is in range.
+func (s *Server) slot(i Index) int {
+	return int(i - s.baseIndex())
+}
+
+// lastIndex returns the index of the last entry in the log, or the snapshot
+// boundary if the log holds only the sentinel.
 func (s *Server) lastIndex() Index {
 	return s.log[len(s.log)-1].Index
 }
 
-// lastTerm returns the term of the last entry in the log, or 0 if the log holds
-// only the sentinel.
+// lastTerm returns the term of the last entry in the log.
 func (s *Server) lastTerm() Term {
 	return s.log[len(s.log)-1].Term
 }
 
-// entryAt returns the entry at index i and whether it exists. Index 0 refers to
-// the sentinel, which exists but carries no command.
+// entryAt returns the entry at index i and whether it exists.
+//
+// An index at or below the snapshot boundary is NOT available: it has been
+// discarded, and the caller must send a snapshot instead of pretending the entry
+// is there. The sentinel itself (i == baseIndex) is returned, because
+// prevLogIndex checks legitimately land on it.
 func (s *Server) entryAt(i Index) (LogEntry, bool) {
-	if i > s.lastIndex() {
+	if i < s.baseIndex() || i > s.lastIndex() {
 		return LogEntry{}, false
 	}
-	// The log is contiguous from the sentinel in Phase 1 (no compaction yet), so
-	// index maps directly onto slice position. This assumption breaks when
-	// snapshotting arrives (LATER.md) and is deliberately localized here.
-	return s.log[i], true
+	return s.log[s.slot(i)], true
+}
+
+// hasEntry reports whether index i is still in the log rather than compacted
+// away. Distinct from entryAt's ok, which is also false for a future index.
+func (s *Server) compactedAway(i Index) bool {
+	return i < s.baseIndex()
 }
 
 // termAt returns the term of the entry at index i, and whether that entry
@@ -64,6 +103,12 @@ func (s *Server) isUpToDate(candLastIndex Index, candLastTerm Term) bool {
 // prevLogIndex 0 always matches: it refers to the sentinel, meaning the leader is
 // sending from the very start of the log.
 func (s *Server) matchesPrevLog(prevLogIndex Index, prevLogTerm Term) bool {
+	// An index below our snapshot boundary is already committed and immutable —
+	// it cannot conflict, so treating it as a match is safe and is what lets a
+	// leader that is behind our snapshot still make progress.
+	if s.compactedAway(prevLogIndex) {
+		return true
+	}
 	t, ok := s.termAt(prevLogIndex)
 	if !ok {
 		return false
@@ -91,12 +136,17 @@ func (s *Server) appendFrom(prevLogIndex Index, entries []LogEntry) bool {
 	for i, e := range entries {
 		idx := prevLogIndex + Index(i) + 1
 
+		if idx <= s.baseIndex() {
+			// Already covered by our snapshot: the entry is committed and immutable,
+			// so there is nothing to append and nothing that may be truncated.
+			continue
+		}
 		if existing, ok := s.entryAt(idx); ok {
 			if existing.Term == e.Term {
 				continue // already present and matching; leave it alone
 			}
 			// Conflict: truncate this entry and everything after it.
-			s.log = s.log[:idx]
+			s.log = s.log[:s.slot(idx)]
 		}
 		s.log = append(s.log, LogEntry{Term: e.Term, Index: idx, Command: e.Command})
 		changed = true

@@ -2,3 +2,10 @@
 *.exe
 *.test
 *.out
+
+# Node artifacts — only ever pulled in ad hoc for headless DOM testing of fe/,
+# never part of the build. The project has zero third-party dependencies and the
+# UI is plain HTML served straight from disk.
+node_modules/
+package.json
+package-lock.json

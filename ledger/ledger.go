@@ -24,6 +24,8 @@ import (
 	"sort"
 	"strings"
 	"sync"
+
+	"github.com/homura/core-bank/hlc"
 )
 
 // Money is an amount in minor units (cents). Integer arithmetic only — binary
@@ -95,6 +97,24 @@ type Command struct {
 	From   AccountID // empty for Deposit and OpenAccount
 	To     AccountID // empty for Withdraw
 	Amount Money
+
+	// Timestamp is the hybrid logical clock reading assigned by the LEADER before
+	// this entry was appended to the log (Phase 3, learn/READING_LIST.md §19).
+	//
+	// In the command rather than read at apply time, and that is not a style
+	// choice: reading the clock during Apply would make two replicas of the same
+	// shard produce different state from the same log, which is the determinism
+	// rule DESIGN.md calls non-negotiable.
+	//
+	// It is what orders events ACROSS shards. Transaction.Seq is a per-shard
+	// counter, so Seq=7 on shard-0 and Seq=7 on shard-1 have no relationship at
+	// all — and the two legs of a cross-shard transfer live in different Raft logs
+	// by construction.
+	//
+	// The zero value means "unstamped", which is what records written before this
+	// field existed carry. Ordering treats them as unordered rather than as
+	// simultaneous events at the beginning of time.
+	Timestamp hlc.Timestamp
 }
 
 // Result is the outcome of applying a command.
@@ -125,6 +145,13 @@ var (
 // The idempotency key is deliberately excluded: the question this answers is
 // "is this the same operation?", and the key is how the operation is being
 // identified, not part of what it does.
+// The HLC timestamp is deliberately EXCLUDED from the fingerprint.
+//
+// A retry of the same request is stamped when it arrives, so it carries a
+// different timestamp — including the timestamp would make every retry look like
+// a different request and return Conflict instead of the original result. The
+// fingerprint answers "is this the same OPERATION", and when it happened is not
+// part of that.
 func (c Command) fingerprint() uint64 {
 	h := fnv.New64a()
 	var b [8]byte
@@ -153,10 +180,18 @@ type Entry struct {
 // moved. Enforcing "entries sum to zero" makes that an invariant the code checks
 // rather than a convention the code hopes for.
 type Transaction struct {
-	Seq            uint64 // monotonic, assigned at apply time — deterministic
+	Seq            uint64 // monotonic per shard, assigned at apply time — deterministic
 	Op             Op
 	IdempotencyKey string
 	Entries        []Entry
+
+	// Timestamp is the HLC reading carried by the command that produced this
+	// transaction (Phase 3).
+	//
+	// Seq orders transactions within THIS shard; Timestamp orders them against
+	// transactions on other shards, which Seq cannot do — Seq=7 here and Seq=7
+	// elsewhere are unrelated numbers. Zero means the command predates HLC.
+	Timestamp hlc.Timestamp
 }
 
 // balances checks the double-entry invariant for a transaction.
@@ -363,6 +398,7 @@ func (s *State) applyLocked(cmd Command) Result {
 func (s *State) record(cmd Command, entries []Entry) {
 	s.seq++
 	t := Transaction{
+		Timestamp:      cmd.Timestamp,
 		Seq:            s.seq,
 		Op:             cmd.Op,
 		IdempotencyKey: cmd.IdempotencyKey,

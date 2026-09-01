@@ -3,6 +3,7 @@ package shard
 import (
 	"testing"
 
+	"github.com/homura/core-bank/hlc"
 	"github.com/homura/core-bank/ledger"
 )
 
@@ -65,7 +66,7 @@ func TestCommitDebitWithoutReservationFails(t *testing.T) {
 	_, st := newTestMachine(t, map[ledger.AccountID]ledger.Money{"alice": 1000})
 	before := total(st)
 
-	res := st.CommitDebit("never-prepared")
+	res := st.CommitDebit("never-prepared", hlc.Timestamp{})
 	if res.OK {
 		t.Fatal("CommitDebit reported success with no reservation held")
 	}

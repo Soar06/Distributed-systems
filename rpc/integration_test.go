@@ -29,6 +29,20 @@ type testCluster struct {
 	states  map[raft.NodeID]*ledger.State
 	wals    map[raft.NodeID]*storage.WAL
 	trans   map[raft.NodeID]*Transport
+	clients map[raft.NodeID]*ClientService
+}
+
+// leaderID returns the current leader's id, for tests that need to reach that
+// node's client service rather than merely its address.
+func (c *testCluster) leaderID(t *testing.T) raft.NodeID {
+	t.Helper()
+	for _, id := range c.ids {
+		if c.servers[id].Role() == raft.Leader {
+			return id
+		}
+	}
+	t.Fatal("no leader")
+	return ""
 }
 
 func startCluster(t *testing.T, n int) *testCluster {
@@ -43,6 +57,7 @@ func startCluster(t *testing.T, n int) *testCluster {
 		states:  make(map[raft.NodeID]*ledger.State),
 		wals:    make(map[raft.NodeID]*storage.WAL),
 		trans:   make(map[raft.NodeID]*Transport),
+		clients: make(map[raft.NodeID]*ClientService),
 	}
 
 	// Bind listeners first so every node knows every address before starting.
@@ -58,7 +73,20 @@ func startCluster(t *testing.T, n int) *testCluster {
 		c.addrs[id] = "127.0.0.1:0"
 	}
 
-	cfg := raft.Config{ElectionTimeoutMin: 80, ElectionTimeoutMax: 160, HeartbeatInterval: 20}
+	// Election timings sized for the test environment, not for a LAN.
+	//
+	// 80-160ms was tight enough that a full parallel `-race` run lost elections to
+	// SCHEDULING delay rather than to any failure: goroutines did not get a core
+	// within the timeout, followers timed out on a healthy leader, and tests that
+	// submit a write then assert it committed failed with "leadership lost" or
+	// "not leader". That is §5.2's inequality violated by the machine, the same
+	// effect measured in the sharded throughput benchmark, and it is an artifact of
+	// the harness rather than a defect in the code under test.
+	//
+	// Widened to keep broadcastTime << electionTimeout true even when the race
+	// detector is instrumenting every memory access. Still far below any real
+	// deployment's timeouts, so nothing about what these tests exercise changes.
+	cfg := raft.Config{ElectionTimeoutMin: 400, ElectionTimeoutMax: 800, HeartbeatInterval: 60}
 
 	// Two passes: create listeners to learn real ports, then wire transports.
 	listeners := make(map[raft.NodeID]*Server)
@@ -72,6 +100,7 @@ func startCluster(t *testing.T, n int) *testCluster {
 		srv.SetStorage(storage.OpenRaftState(walPath, nil))
 
 		api := NewClientService(srv, machine, c.addrs)
+		c.clients[id] = api
 		rs, err := Listen("127.0.0.1:0", srv, api)
 		if err != nil {
 			t.Fatalf("listen %s: %v", id, err)

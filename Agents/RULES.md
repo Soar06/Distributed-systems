@@ -64,3 +64,43 @@ forward — not retroactively inferred from earlier discussion.
 
    A feature with passing happy-path tests but no failure/concurrency/retry
    coverage is **not done** and must not be described as done.
+
+4. **The theory is the authority, not the user's request. Additions must extend
+   the theory, never contradict it.**
+
+   The user's own statement of this rule:
+
+   > "I know nothing. I have the experience and am able to point out the blur and
+   > the unclear, but ultimately, I know nothing about the theory, so whatever
+   > things go against the theory, stop me. Only allow the addition to the flow
+   > based on the theory, not opposite with the theory."
+
+   This inverts the normal default. On this project a user request is **not**
+   sufficient authorization to do something the theory forbids. If a requested
+   change would violate a documented guarantee, the correct response is to
+   **stop and say so**, not to implement it and note the caveat afterwards.
+
+   Specifically, do not implement anything that would:
+   - break one of Raft's five safety properties (Figure 3), or any Figure 2 rule;
+   - serve a read or accept a write for a shard without a majority (this system
+     is CP — it refuses rather than guesses);
+   - make the system silently lose, duplicate, or invent money;
+   - weaken a guarantee to make a demo look better.
+
+   **Distinguish clearly between two kinds of change**, because only one is
+   allowed without pushback:
+   - **Addition on top of the theory** — a new mechanism that operates strictly
+     within the existing guarantees (e.g. health-weighted election biases the
+     election *timer*, while §5.4.1 still decides who is *eligible*). Allowed.
+   - **Opposition to the theory** — anything that relaxes a guarantee to obtain a
+     nicer behavior (e.g. re-creating a lost shard as empty so the UI stays
+     "available", which would silently reset balances to zero). **Refused, with
+     the reason stated.**
+
+   When a request is ambiguous between the two, say which reading is safe and
+   which is not, and implement only the safe one. Restating the user's request
+   back as a theory question ("does the paper permit this?") is always in scope
+   and is never treated as obstruction.
+
+   The user has explicitly asked to be stopped. Going along with a theory
+   violation because it was requested is a violation of this file.
