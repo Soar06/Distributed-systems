@@ -9,3 +9,10 @@
 node_modules/
 package.json
 package-lock.json
+
+# Demo runtime state. Written by `cmd/demo -data <dir>`: one WAL and applied
+# marker per (machine, shard) replica. Regenerated on every run and rewritten on
+# every write, so committing it means a diff on every demo launch — and the
+# contents are a snapshot of one throwaway session, not something anyone should
+# restore from.
+demo-data/
